@@ -125,6 +125,7 @@
     <div class="capture-actions">
       <button class="btn-secondary" id="btnCamera" type="button">📷 Prendre une photo</button>
       <button class="btn-secondary" id="btnGallery" type="button">🖼️ Depuis la galerie</button>
+      <button class="btn-secondary" id="btnRetryRead" type="button" style="display:none;">🔄 Relire le ticket</button>
       <button class="btn-ghost" id="btnClearPhoto" type="button" style="display:none;">retirer la photo</button>
     </div>
     <input type="file" id="fileCamera" accept="image/*" capture="environment">
@@ -309,7 +310,8 @@ const APP_SHARED_KEY = ";~+%?pmN'Kr=7:Ht=YYk9C'<m[/ge;N.EYQeWqu*3+X-{R$w`<"; // 
 const LS_KEY = 'ndf-app-entries';
 const LS_HEADER = 'ndf-app-header';
 let entries = [];   // {id, date, provider, invoiceNumber, description, ht, vat, currency, exchangeRate, place, mission, hasPhoto}
-let currentPhotoBlob = null; // photo attachée au formulaire en cours
+let currentPhotoBlob = null; // photo attachée au formulaire en cours (version compressée, stockée)
+let currentPhotoFile = null; // fichier d'origine, conservé pour pouvoir relancer une lecture plus fine
 let editingId = null;
 
 function loadState(){
@@ -375,7 +377,7 @@ function blobToBase64(blob){
   });
 }
 
-async function callVisionService(blob){
+async function callVisionService(blob, isRetry){
   if(!WORKER_URL || WORKER_URL.indexOf('REMPLACE_PAR') === 0 || !APP_SHARED_KEY || APP_SHARED_KEY.indexOf('REMPLACE_PAR') === 0){
     const e = new Error('Service non configuré'); e.code = 'CONFIG_MISSING'; throw e;
   }
@@ -385,7 +387,7 @@ async function callVisionService(blob){
     resp = await fetch(WORKER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-App-Key': APP_SHARED_KEY },
-      body: JSON.stringify({ imageBase64: base64, mimeType: 'image/jpeg' })
+      body: JSON.stringify({ imageBase64: base64, mimeType: 'image/jpeg', retry: !!isRetry })
     });
   }catch(netErr){
     const e = new Error('Réseau indisponible'); e.code = 'NETWORK'; throw e;
@@ -405,6 +407,7 @@ function showPhotoPreview(blob){
   $('captureEmpty').style.display = 'none';
   $('captureZone').classList.add('has-photo');
   $('btnClearPhoto').style.display = 'inline-block';
+  $('btnRetryRead').style.display = 'inline-block';
 }
 function clearPhoto(){
   currentPhotoBlob = null;
@@ -412,20 +415,43 @@ function clearPhoto(){
   $('captureEmpty').style.display = 'block';
   $('captureZone').classList.remove('has-photo');
   $('btnClearPhoto').style.display = 'none';
+  $('btnRetryRead').style.display = 'none';
+  currentPhotoFile = null;
   $('fileCamera').value = ''; $('fileGallery').value = '';
 }
 
-async function handleFile(file){
-  if(!file) return;
-  $('ocrStatus').classList.add('active');
-  $('ocrStatusText').textContent = 'Compression de la photo…';
-  try{
-    const blob = await fileToCompressedBlob(file);
-    currentPhotoBlob = blob;
-    showPhotoPreview(blob);
+/* Relance une lecture sur la photo déjà chargée. On renvoie une image nettement
+   plus fine que lors du premier essai (2200 px au lieu de 1500, compression plus
+   légère) : c'est souvent ce qui manque quand les petits chiffres d'un ticket
+   n'ont pas été déchiffrés. Le service est aussi prévenu qu'il s'agit d'un second
+   essai, pour qu'il examine l'image plus attentivement. */
+async function retryRead(){
+  if(!currentPhotoFile && !currentPhotoBlob){ toast('Aucune photo à relire'); return; }
+  await handleFile(currentPhotoFile || currentPhotoBlob, true);
+}
 
-    $('ocrStatusText').textContent = 'Lecture du ticket par l\'IA…';
-    const result = await callVisionService(blob);
+async function handleFile(file, isRetry){
+  if(!file) return;
+  if(!isRetry) currentPhotoFile = file;
+  $('ocrStatus').classList.add('active');
+  $('ocrStatusText').textContent = isRetry ? 'Nouvelle lecture, plus fine…' : 'Compression de la photo…';
+  try{
+    let sent;
+    if(isRetry){
+      // seconde tentative : image plus grande et moins compressée
+      sent = await fileToCompressedBlob(file, 2200, 0.9);
+      // on repart d'une ardoise propre pour que la nouvelle lecture remplace vraiment l'ancienne
+      ['fDate','fProvider','fInvoice','fDescription','fHT','fVAT'].forEach(id => $(id).value = '');
+    } else {
+      sent = await fileToCompressedBlob(file);
+      currentPhotoBlob = sent;
+      showPhotoPreview(sent);
+    }
+
+    $('ocrStatusText').textContent = isRetry
+      ? 'L\'IA relit le ticket…'
+      : 'Lecture du ticket par l\'IA…';
+    const result = await callVisionService(sent, isRetry);
 
     if(result.date) $('fDate').value = result.date;
     if(result.provider) $('fProvider').value = result.provider;
@@ -463,7 +489,8 @@ async function handleFile(file){
       onCurrencyChange();
     }
     updateComputedFields();
-    toast(amountNote || 'Ticket lu automatiquement — vérifie avant d\'ajouter');
+    toast(amountNote || (isRetry ? 'Nouvelle lecture terminée — vérifie les champs'
+                                 : 'Ticket lu automatiquement — vérifie avant d\'ajouter'));
   }catch(err){
     console.error(err);
     if(err.code === 'CONFIG_MISSING'){
@@ -951,6 +978,15 @@ async function buildWorkbook(){
   const sorted = sortedEntries();
   const capped = sorted.slice(0, 40);
 
+  /* Le modèle utilise des "formules partagées" : la ligne 6 porte la formule et les
+     lignes 7 à 44 s'y réfèrent. Dès qu'on réécrit la ligne 6, toutes les suivantes
+     perdent leur référence et le total ne se calcule plus. On réécrit donc les
+     formules de TOUTES les lignes 5 à 44 en formules autonomes. */
+  for(let row = 5; row <= 44; row++){
+    setFormula(sheetDoc, 'H' + row, `G${row}+F${row}`);
+    setFormula(sheetDoc, 'K' + row, `ROUND(J${row}*H${row},2)`);
+  }
+
   capped.forEach((e, idx) => {
     const row = 5 + idx;
     setDate(sheetDoc, 'B' + row, e.date);
@@ -1127,6 +1163,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('fileCamera').addEventListener('change', e => handleFile(e.target.files[0]));
   $('fileGallery').addEventListener('change', e => handleFile(e.target.files[0]));
   $('btnClearPhoto').addEventListener('click', clearPhoto);
+  $('btnRetryRead').addEventListener('click', retryRead);
 
   $('btnAddEntry').addEventListener('click', addOrUpdateEntry);
   $('btnResetForm').addEventListener('click', resetForm);
