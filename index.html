@@ -397,7 +397,24 @@ async function callVisionService(blob, isRetry){
     const e = new Error('Réseau indisponible'); e.code = 'NETWORK'; throw e;
   }
   if(resp.status === 401){ const e = new Error('Clé refusée'); e.code = 'UNAUTHORIZED'; throw e; }
-  if(!resp.ok){ const e = new Error('Erreur service ('+resp.status+')'); e.code = 'HTTP_'+resp.status; throw e; }
+  if(!resp.ok){
+    // On récupère le détail renvoyé par le service pour dire précisément ce qui cloche,
+    // au lieu d'un « impossible » qui n'aide personne à diagnostiquer.
+    let info = {};
+    try{ info = await resp.json(); }catch(_){}
+    console.error('Réponse du service de lecture :', resp.status, info);
+    const e = new Error('Erreur service');
+    e.code = 'SERVICE_ERROR';
+    e.httpStatus = resp.status;
+    e.info = info;
+    if(info.error === 'server_misconfigured') e.reason = 'la clé Gemini n\'est pas configurée sur le serveur';
+    else if(info.error === 'upstream_network_error') e.reason = 'le service Google est injoignable';
+    else if(info.error === 'upstream_error' && info.status === 429) e.reason = 'quota de lecture du jour épuisé';
+    else if(info.error === 'upstream_error' && (info.status === 403 || info.status === 400)) e.reason = 'la clé Gemini est refusée par Google';
+    else if(info.error === 'upstream_error' && info.status === 404) e.reason = 'aucun modèle de lecture disponible';
+    else e.reason = 'erreur ' + resp.status + (info.error ? ' (' + info.error + ')' : '');
+    throw e;
+  }
   const data = await resp.json();
   if(!data || typeof data !== 'object'){ const e = new Error('Réponse invalide'); e.code = 'BAD_RESPONSE'; throw e; }
   return data;
@@ -443,7 +460,7 @@ async function handleFile(file, isRetry){
     let sent;
     if(isRetry){
       // seconde tentative : image plus grande et moins compressée
-      sent = await fileToCompressedBlob(file, 2200, 0.9);
+      sent = await fileToCompressedBlob(file, 2000, 0.82);
       // on repart d'une ardoise propre pour que la nouvelle lecture remplace vraiment l'ancienne
       ['fDate','fProvider','fInvoice','fDescription','fHT','fVAT'].forEach(id => $(id).value = '');
     } else {
@@ -503,6 +520,8 @@ async function handleFile(file, isRetry){
       toast('Service de lecture indisponible — contacte l\'administrateur de l\'appli');
     } else if(err.code === 'NETWORK'){
       toast('Pas de connexion — remplis les champs à la main');
+    } else if(err.code === 'SERVICE_ERROR'){
+      toast('Lecture impossible : ' + err.reason + ' — remplis les champs à la main');
     } else {
       toast('Lecture automatique impossible — remplis les champs à la main');
     }
