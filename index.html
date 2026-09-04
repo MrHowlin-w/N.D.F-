@@ -242,7 +242,8 @@
 </div>
 <div class="toast" id="toast"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<!-- JSZip sert à la fois à fabriquer le .xlsx (le modèle est une archive zip) et à
+     regrouper les photos. C'est la seule dépendance externe de l'appli. -->
 <script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"></script>
 
 <script>
@@ -673,62 +674,185 @@ function openPhotoModal(id){
   });
 }
 
-/* ===================== Export Excel (basé sur le modèle S³) ===================== */
-function setCellValue(ws, addr, value, type){
-  let cell = ws[addr];
-  if(!cell){ cell = {}; ws[addr] = cell; }
-  delete cell.f;
-  cell.t = type;
-  cell.v = value;
-  delete cell.w;
-  return cell;
+/* ===================== Export Excel (basé sur le modèle S³) =====================
+   On n'utilise PAS une librairie de lecture/écriture de classeur : la version libre
+   de SheetJS ne conserve pas les styles (bordures, gras, fonds de couleur), et le
+   fichier rendu à la compta perdait la mise en forme du modèle.
+   À la place on ouvre le .xlsx du modèle comme ce qu'il est — une archive zip de XML —
+   et on n'écrit QUE les valeurs dans les cellules déjà présentes, sans jamais toucher
+   à styles.xml ni à l'attribut de style de chaque cellule. La mise en forme d'origine
+   est donc conservée à l'identique, par construction. */
+
+const XL_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+
+function colToNum(col){
+  let n = 0;
+  for(let i = 0; i < col.length; i++) n = n * 26 + (col.charCodeAt(i) - 64);
+  return n;
 }
-function setCellFormula(ws, addr, formula){
-  let cell = ws[addr];
-  if(!cell){ cell = {}; ws[addr] = cell; }
-  cell.t = 'n';
-  cell.f = formula;
-  delete cell.v;
-  delete cell.w;
+function splitRef(ref){
+  const m = /^([A-Z]+)(\d+)$/.exec(ref);
+  return { col: m[1], row: parseInt(m[2], 10) };
 }
-function dateFromISO(iso){
-  const [y,m,d] = iso.split('-').map(Number);
-  return new Date(Date.UTC(y, m-1, d));
+/* Excel compte les jours depuis le 30/12/1899 (et non le 01/01/1900, à cause du
+   bug historique de l'année bissextile 1900 conservé par compatibilité). */
+function excelSerialFromISO(iso){
+  const [y, m, d] = iso.split('-').map(Number);
+  return Math.round((Date.UTC(y, m - 1, d) - Date.UTC(1899, 11, 30)) / 86400000);
 }
 
-function buildWorkbook(){
-  const wb = XLSX.read(TEMPLATE_B64, {type:'base64', cellDates:true});
-  const sheetName = wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
+/* Retrouve (ou crée, en respectant l'ordre des colonnes) la cellule <c r="..."> */
+function findOrCreateCell(sheetDoc, ref){
+  const { col, row } = splitRef(ref);
+  const sheetData = sheetDoc.getElementsByTagName('sheetData')[0];
+  let rowEl = null;
+  const rows = sheetData.getElementsByTagName('row');
+  for(let i = 0; i < rows.length; i++){
+    if(parseInt(rows[i].getAttribute('r'), 10) === row){ rowEl = rows[i]; break; }
+  }
+  if(!rowEl){
+    rowEl = sheetDoc.createElementNS(XL_NS, 'row');
+    rowEl.setAttribute('r', String(row));
+    let inserted = false;
+    for(let i = 0; i < rows.length; i++){
+      if(parseInt(rows[i].getAttribute('r'), 10) > row){ sheetData.insertBefore(rowEl, rows[i]); inserted = true; break; }
+    }
+    if(!inserted) sheetData.appendChild(rowEl);
+  }
+  const cells = rowEl.getElementsByTagName('c');
+  for(let i = 0; i < cells.length; i++){
+    if(cells[i].getAttribute('r') === ref) return cells[i];
+  }
+  const cell = sheetDoc.createElementNS(XL_NS, 'c');
+  cell.setAttribute('r', ref);
+  const target = colToNum(col);
+  let inserted = false;
+  for(let i = 0; i < cells.length; i++){
+    if(colToNum(splitRef(cells[i].getAttribute('r')).col) > target){ rowEl.insertBefore(cell, cells[i]); inserted = true; break; }
+  }
+  if(!inserted) rowEl.appendChild(cell);
+  return cell;
+}
+
+function clearCell(cell){
+  while(cell.firstChild) cell.removeChild(cell.firstChild);
+  cell.removeAttribute('t');   // le style (attribut s) est volontairement conservé
+}
+
+function setNumber(sheetDoc, ref, num){
+  const cell = findOrCreateCell(sheetDoc, ref);
+  clearCell(cell);
+  const v = sheetDoc.createElementNS(XL_NS, 'v');
+  v.appendChild(sheetDoc.createTextNode(String(num)));
+  cell.appendChild(v);
+}
+/* Chaîne écrite en "inline string" : évite de toucher à sharedStrings.xml */
+function setText(sheetDoc, ref, text){
+  const cell = findOrCreateCell(sheetDoc, ref);
+  clearCell(cell);
+  if(text === '' || text === null || text === undefined) return;
+  cell.setAttribute('t', 'inlineStr');
+  const is = sheetDoc.createElementNS(XL_NS, 'is');
+  const t = sheetDoc.createElementNS(XL_NS, 't');
+  t.setAttribute('xml:space', 'preserve');
+  t.appendChild(sheetDoc.createTextNode(String(text)));
+  is.appendChild(t); cell.appendChild(is);
+}
+function setDate(sheetDoc, ref, iso){
+  setNumber(sheetDoc, ref, excelSerialFromISO(iso));  // le format d'affichage vient du style
+}
+function setFormula(sheetDoc, ref, formula){
+  const cell = findOrCreateCell(sheetDoc, ref);
+  clearCell(cell);
+  const f = sheetDoc.createElementNS(XL_NS, 'f');
+  f.appendChild(sheetDoc.createTextNode(formula));
+  cell.appendChild(f);   // pas de <v> : Excel recalcule à l'ouverture
+}
+
+function b64ToUint8(b64){
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+
+async function buildWorkbook(){
+  const zip = await JSZip.loadAsync(b64ToUint8(TEMPLATE_B64));
+  const parser = new DOMParser();
+  const serializer = new XMLSerializer();
+
+  const sheetXml = await zip.file('xl/worksheets/sheet1.xml').async('string');
+  const sheetDoc = parser.parseFromString(sheetXml, 'application/xml');
 
   const surname = $('fSurname').value.trim();
   const name = $('fName').value.trim();
   const missionDate = $('fMissionDate').value;
-
-  if(surname) setCellValue(ws, 'C1', surname, 's');
-  if(name) setCellValue(ws, 'C2', name, 's');
-  if(missionDate) setCellValue(ws, 'G1', dateFromISO(missionDate), 'd');
+  if(surname) setText(sheetDoc, 'C1', surname);
+  if(name) setText(sheetDoc, 'C2', name);
+  if(missionDate) setDate(sheetDoc, 'G1', missionDate);
 
   const sorted = sortedEntries();
   const capped = sorted.slice(0, 40);
 
   capped.forEach((e, idx) => {
     const row = 5 + idx;
-    setCellValue(ws, 'B'+row, dateFromISO(e.date), 'd');
-    setCellValue(ws, 'C'+row, e.provider || '', 's');
-    setCellValue(ws, 'D'+row, e.invoiceNumber || '', 's');
-    setCellValue(ws, 'E'+row, e.description || '', 's');
-    setCellValue(ws, 'F'+row, e.ht || 0, 'n');
-    setCellValue(ws, 'G'+row, e.vat || 0, 'n');
-    setCellFormula(ws, 'H'+row, `G${row}+F${row}`);
-    setCellValue(ws, 'I'+row, e.currency || '', 's');
-    setCellValue(ws, 'J'+row, e.exchangeRate || 1, 'n');
-    setCellFormula(ws, 'K'+row, `ROUND(J${row}*H${row},2)`);
-    setCellValue(ws, 'L'+row, e.place || '', 's');
-    setCellValue(ws, 'M'+row, e.mission || '', 's');
+    setDate(sheetDoc, 'B' + row, e.date);
+    setText(sheetDoc, 'C' + row, e.provider || '');
+    setText(sheetDoc, 'D' + row, e.invoiceNumber || '');
+    setText(sheetDoc, 'E' + row, e.description || '');
+    setNumber(sheetDoc, 'F' + row, e.ht || 0);
+    setNumber(sheetDoc, 'G' + row, e.vat || 0);
+    setFormula(sheetDoc, 'H' + row, `G${row}+F${row}`);
+    setText(sheetDoc, 'I' + row, e.currency || '');
+    setNumber(sheetDoc, 'J' + row, e.exchangeRate || 1);
+    setFormula(sheetDoc, 'K' + row, `ROUND(J${row}*H${row},2)`);
+    setText(sheetDoc, 'L' + row, e.place || '');
+    setText(sheetDoc, 'M' + row, e.mission || '');
   });
 
-  return { wb, count: capped.length, overflow: sorted.length - capped.length };
+  /* Le modèle stocke un résultat en cache (<v>) à côté de chaque formule, tous à 0.
+     On les retire partout : sinon un tableur qui ne recalcule pas à l'ouverture
+     (LibreOffice par défaut, certains aperçus mobiles) afficherait un total à 0
+     alors que les lignes sont bonnes. */
+  const allCells = sheetDoc.getElementsByTagName('c');
+  for(let i = 0; i < allCells.length; i++){
+    const c = allCells[i];
+    if(c.getElementsByTagName('f').length === 0) continue;
+    const vs = c.getElementsByTagName('v');
+    while(vs.length) c.removeChild(vs[0]);
+  }
+
+  zip.file('xl/worksheets/sheet1.xml', serializer.serializeToString(sheetDoc));
+
+  /* Les <v> mis en cache ont été retirés : on demande à Excel de tout recalculer
+     à l'ouverture, sinon les totaux resteraient affichés à 0. */
+  let wbXml = await zip.file('xl/workbook.xml').async('string');
+  if(/<calcPr[^>]*\/>/.test(wbXml)){
+    wbXml = wbXml.replace(/<calcPr([^>]*)\/>/, (m, attrs) =>
+      '<calcPr' + attrs.replace(/\s*fullCalcOnLoad="[^"]*"/, '') + ' fullCalcOnLoad="1"/>');
+  } else {
+    wbXml = wbXml.replace('</workbook>', '<calcPr calcId="191029" fullCalcOnLoad="1"/></workbook>');
+  }
+  zip.file('xl/workbook.xml', wbXml);
+
+  /* La chaîne de calcul du modèle ne correspond plus à nos formules : on la supprime
+     (Excel la reconstruit seul). La laisser provoquerait un message de réparation. */
+  if(zip.file('xl/calcChain.xml')){
+    zip.remove('xl/calcChain.xml');
+    let ct = await zip.file('[Content_Types].xml').async('string');
+    ct = ct.replace(/<Override[^>]*calcChain\.xml[^>]*\/>/, '');
+    zip.file('[Content_Types].xml', ct);
+    let rels = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+    rels = rels.replace(/<Relationship[^>]*calcChain\.xml[^>]*\/>/, '');
+    zip.file('xl/_rels/workbook.xml.rels', rels);
+  }
+
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    compression: 'DEFLATE'
+  });
+  return { blob, count: capped.length, overflow: sorted.length - capped.length };
 }
 
 function fileSafe(str){
@@ -743,11 +867,9 @@ function downloadBlob(blob, filename){
   setTimeout(()=>URL.revokeObjectURL(url), 4000);
 }
 
-function exportXlsx(){
+async function exportXlsx(){
   if(entries.length === 0){ toast('Ajoute au moins une dépense avant d\'exporter'); return; }
-  const { wb, count, overflow } = buildWorkbook();
-  const out = XLSX.write(wb, {bookType:'xlsx', type:'array'});
-  const blob = new Blob([out], {type:'application/octet-stream'});
+  const { blob, count, overflow } = await buildWorkbook();
   const surname = fileSafe($('fSurname').value) || 'NDF';
   const dateTag = $('fMissionDate').value || new Date().toISOString().slice(0,10);
   downloadBlob(blob, `NDF_${surname}_${dateTag}.xlsx`);
