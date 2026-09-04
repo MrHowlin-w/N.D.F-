@@ -430,8 +430,27 @@ async function handleFile(file){
     if(result.provider) $('fProvider').value = result.provider;
     if(result.invoiceNumber) $('fInvoice').value = result.invoiceNumber;
     if(result.description) $('fDescription').value = result.description;
-    if(result.ht !== null && result.ht !== undefined) $('fHT').value = result.ht;
-    if(result.vat !== null && result.vat !== undefined) $('fVAT').value = result.vat;
+    /* --- Montants : on réconcilie HT / TVA / TTC, quel que soit ce que le ticket affiche.
+           Beaucoup de tickets ne montrent que le total TTC : dans ce cas il ne faut surtout
+           pas laisser les trois champs vides. --- */
+    const asNum = v => (typeof v === 'number' && isFinite(v)) ? v : null;
+    let ht = asNum(result.ht), vat = asNum(result.vat), ttc = asNum(result.ttc);
+    let amountNote = '';
+
+    if(ht === null && ttc !== null && vat !== null)      ht  = round2(ttc - vat);
+    else if(vat === null && ttc !== null && ht !== null) vat = round2(ttc - ht);
+    else if(ht === null && vat === null && ttc !== null){
+      // seul le TTC est lisible : on garde le total juste, la TVA reste à compléter
+      ht = ttc; vat = 0;
+      amountNote = 'TVA non détaillée sur le ticket — vérifie le HT et la TVA';
+    }
+    if(ht !== null && ht < 0) ht = null;
+    if(vat !== null && vat < 0) vat = null;
+
+    if(ht !== null)  $('fHT').value = ht;
+    if(vat !== null) $('fVAT').value = vat;
+    if(ht === null && vat === null) amountNote = 'Montants non détectés — saisis-les à la main';
+
     if(result.currency){
       const known = ['EUR','USD','GBP','BRL','XPF','CHF'];
       if(known.includes(result.currency)){
@@ -443,7 +462,7 @@ async function handleFile(file){
       onCurrencyChange();
     }
     updateComputedFields();
-    toast('Ticket lu automatiquement — vérifie avant d\'ajouter');
+    toast(amountNote || 'Ticket lu automatiquement — vérifie avant d\'ajouter');
   }catch(err){
     console.error(err);
     if(err.code === 'CONFIG_MISSING'){
