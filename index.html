@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Notes de Frais</title>
 <meta name="theme-color" content="#1c2230">
 <meta name="mobile-web-app-capable" content="yes">
@@ -28,7 +28,10 @@
     }
   }
   *{box-sizing:border-box;}
-  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;padding-bottom:60px;}
+  /* Page figée horizontalement : rien ne déborde, rien ne se balade latéralement. */
+  html,body{max-width:100%;overflow-x:hidden;overscroll-behavior-x:none;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;padding-bottom:60px;
+    -webkit-text-size-adjust:100%;text-size-adjust:100%;touch-action:pan-y;}
   main{max-width:720px;margin:0 auto;padding:12px 12px 0;}
   .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin-top:14px;box-shadow:var(--shadow);}
   .card h2{margin:0 0 12px;font-size:1.02rem;font-weight:700;display:flex;align-items:center;gap:8px;}
@@ -37,7 +40,10 @@
   label:first-child{margin-top:0;}
   input[type=text], input[type=number], input[type=date], select, textarea{
     width:100%;min-width:0;padding:10px 11px;border:1px solid var(--border);border-radius:9px;
-    background:var(--input-bg);color:var(--text);font-size:.95rem;font-family:inherit;
+    background:var(--input-bg);color:var(--text);font-family:inherit;
+    /* 16 px : en dessous de cette taille, Safari sur iPhone zoome tout seul dès
+       qu'on touche un champ, et la page reste ensuite décalée. */
+    font-size:16px;
     box-sizing:border-box;
   }
   input[type=text], input[type=number], input[type=date], select{
@@ -50,7 +56,9 @@
   .row3 > div{min-width:0;}
   @media (max-width:480px){ .row3{grid-template-columns:1fr 1fr;} }
   @media (max-width:400px){ .row2{grid-template-columns:1fr;} }
-  button{cursor:pointer;font-family:inherit;font-size:.92rem;font-weight:700;border-radius:10px;border:none;padding:12px 16px;}
+  button{cursor:pointer;font-family:inherit;font-size:.92rem;font-weight:700;border-radius:10px;border:none;padding:12px 16px;
+    min-width:0;overflow-wrap:anywhere;}
+  @media (max-width:360px){ .btn-row button{font-size:.85rem;padding:11px 10px;} }
   .btn-main{background:var(--accent);color:var(--accent-contrast);width:100%;}
   .btn-main:active{background:var(--accent-dark);}
   .btn-secondary{background:transparent;border:1.5px solid var(--border);color:var(--text);}
@@ -69,14 +77,28 @@
   @keyframes spin{to{transform:rotate(360deg);}}
   .ttc-line, .eur-line{display:flex;justify-content:space-between;background:var(--input-bg);border:1px solid var(--border);border-radius:9px;padding:9px 11px;margin-top:10px;font-size:.9rem;}
   .ttc-line b, .eur-line b{font-variant-numeric:tabular-nums;}
-  table{width:100%;border-collapse:collapse;font-size:.83rem;}
-  th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--border);vertical-align:middle;}
+  #tableWrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+  table{width:100%;border-collapse:collapse;font-size:.83rem;table-layout:fixed;}
+  th,td{text-align:left;padding:7px 5px;border-bottom:1px solid var(--border);vertical-align:middle;}
   th{font-size:.68rem;text-transform:uppercase;color:var(--muted);font-weight:700;}
   td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;}
+  /* largeurs fixes : la colonne "dépense" absorbe la place restante */
+  col.c-thumb{width:44px;} col.c-amount{width:88px;} col.c-act{width:62px;}
+  .cell-main{display:flex;flex-direction:column;gap:1px;min-width:0;}
+  .cell-main .meta{font-size:.7rem;color:var(--muted);}
+  .cell-main .prov{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .cell-amount .eur{display:block;font-size:.7rem;color:var(--muted);font-weight:400;}
   .thumb{width:34px;height:34px;object-fit:cover;border-radius:6px;border:1px solid var(--border);cursor:pointer;}
   .thumb.empty{display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:.6rem;background:var(--input-bg);}
-  .row-actions{display:flex;gap:6px;}
-  .row-actions button{padding:4px 7px;font-size:.75rem;border-radius:6px;}
+  .row-actions{display:flex;gap:5px;justify-content:flex-end;}
+  .row-actions button{padding:5px 6px;font-size:.75rem;line-height:1;border-radius:6px;}
+  /* Sur les écrans les plus étroits, les deux boutons d'action passent l'un
+     au-dessus de l'autre : ils restent entièrement visibles et cliquables. */
+  @media (max-width:400px){
+    .row-actions{flex-direction:column;gap:4px;align-items:stretch;}
+    col.c-act{width:42px;}
+    col.c-amount{width:82px;}
+  }
   .empty-hint{color:var(--muted);font-size:.85rem;text-align:center;padding:14px 4px;}
   .totals{display:flex;justify-content:space-between;align-items:baseline;margin-top:10px;padding-top:10px;border-top:2px solid var(--border);}
   .totals b{font-size:1.15rem;}
@@ -204,9 +226,12 @@
     <div id="tableWrap">
       <p class="empty-hint" id="emptyHint">Aucune dépense pour l'instant. Ajoute ta première photo de ticket ci-dessus.</p>
       <table id="entriesTable" style="display:none;">
+        <colgroup>
+          <col class="c-thumb"><col><col class="c-amount"><col class="c-act">
+        </colgroup>
         <thead>
           <tr>
-            <th></th><th>Date</th><th>Fournisseur</th><th class="num">TTC</th><th class="num">EUR</th><th></th>
+            <th></th><th>Dépense</th><th class="num">Montant</th><th></th>
           </tr>
         </thead>
         <tbody id="entriesBody"></tbody>
@@ -685,19 +710,31 @@ async function renderTable(){
       tdThumb.appendChild(d);
     }
 
-    const tdDate = document.createElement('td');
-    tdDate.textContent = `#${i+1} · ` + (e.date ? e.date.split('-').reverse().join('/') : '?');
+    /* Date + fournisseur dans une seule cellule sur deux lignes, et montant en
+       devise + équivalent euro dans une autre : quatre colonnes au lieu de six,
+       le tableau tient alors sur l'écran le plus étroit sans défilement latéral. */
+    const tdMain = document.createElement('td');
+    const main = document.createElement('div');
+    main.className = 'cell-main';
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = `#${i+1} · ` + (e.date ? e.date.split('-').reverse().join('/') : '?');
+    const prov = document.createElement('span');
+    prov.className = 'prov';
+    prov.textContent = e.provider || '(sans nom)';
+    prov.title = e.provider || '';
+    main.appendChild(meta); main.appendChild(prov);
+    tdMain.appendChild(main);
 
-    const tdProvider = document.createElement('td');
-    tdProvider.textContent = e.provider || '(sans nom)';
-
-    const tdTtc = document.createElement('td');
-    tdTtc.className = 'num';
-    tdTtc.textContent = ttc.toFixed(2) + ' ' + currencySymbol(e.currency);
-
-    const tdEur = document.createElement('td');
-    tdEur.className = 'num';
-    tdEur.textContent = eur.toFixed(2) + ' €';
+    const tdAmount = document.createElement('td');
+    tdAmount.className = 'num cell-amount';
+    tdAmount.appendChild(document.createTextNode(ttc.toFixed(2) + ' ' + (currencySymbol(e.currency) || e.currency || '')));
+    if(Math.abs(eur - ttc) > 0.005 || (e.currency && e.currency !== 'EUR')){
+      const sub = document.createElement('span');
+      sub.className = 'eur';
+      sub.textContent = '= ' + eur.toFixed(2) + ' €';
+      tdAmount.appendChild(sub);
+    }
 
     const tdActions = document.createElement('td');
     const wrap = document.createElement('div');
@@ -711,8 +748,8 @@ async function renderTable(){
     wrap.appendChild(btnEdit); wrap.appendChild(btnDel);
     tdActions.appendChild(wrap);
 
-    tr.appendChild(tdThumb); tr.appendChild(tdDate); tr.appendChild(tdProvider);
-    tr.appendChild(tdTtc); tr.appendChild(tdEur); tr.appendChild(tdActions);
+    tr.appendChild(tdThumb); tr.appendChild(tdMain);
+    tr.appendChild(tdAmount); tr.appendChild(tdActions);
     body.appendChild(tr);
   }
   $('totalEur').textContent = round2(total).toFixed(2) + ' €';
@@ -872,14 +909,16 @@ function addHyperlinkStyle(stylesXml){
 
   // on clone le format du numéro d'Item (bordure + centrage) en changeant la police
   const itemXf = '<xf numFmtId="0" fontId="' + newFontId + '" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>';
-  stylesXml = stylesXml.replace(/<cellXfs count="\d+"([^>]*)>/, `<cellXfs count="${xfCount + 1}"$1>`);
-  stylesXml = stylesXml.replace('</cellXfs>', itemXf + '</cellXfs>');
+  // et un format aligné en haut, pour le numéro placé en face de chaque photo
+  const topXf = '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="top"/></xf>';
+  stylesXml = stylesXml.replace(/<cellXfs count="\d+"([^>]*)>/, `<cellXfs count="${xfCount + 2}"$1>`);
+  stylesXml = stylesXml.replace('</cellXfs>', itemXf + topXf + '</cellXfs>');
 
-  return { stylesXml, linkXfId: newXfId };
+  return { stylesXml, linkXfId: newXfId, topXfId: newXfId + 1 };
 }
 
 /* Construit l'onglet Justificatifs + le drawing qui place les images. */
-async function addPhotoSheet(zip, capped, sheetDoc, linkXfId){
+async function addPhotoSheet(zip, capped, sheetDoc, linkXfId, topXfId){
   const photos = [];
   for(let i = 0; i < capped.length; i++){
     const e = capped[i];
@@ -896,8 +935,10 @@ async function addPhotoSheet(zip, capped, sheetDoc, linkXfId){
   let anchorsXml = '';
   let relsXml = '';
   let linksXml = '';
+  /* La colonne A ne reçoit jamais de photo : elle reste lisible et porte le numéro
+     du justificatif, en face de son image. Les photos démarrent en colonne B. */
   const cols =
-    '<cols><col min="1" max="1" width="8" customWidth="1"/><col min="2" max="2" width="13" customWidth="1"/>' +
+    '<cols><col min="1" max="1" width="7" customWidth="1"/><col min="2" max="2" width="13" customWidth="1"/>' +
     '<col min="3" max="3" width="26" customWidth="1"/><col min="4" max="4" width="30" customWidth="1"/>' +
     '<col min="5" max="5" width="26" customWidth="1"/></cols>';
 
@@ -930,13 +971,14 @@ async function addPhotoSheet(zip, capped, sheetDoc, linkXfId){
       '</row>';
     linksXml += `<hyperlink ref="E${infoRow}" location="Sheet1!A${sheetRow}" display="Retour au tableau"/>`;
 
-    rowsXml += `<row r="${imgRow}" ht="${(PHOTO_HEIGHT_CM * PT_PER_CM).toFixed(0)}" customHeight="1"/>`;
+    rowsXml += `<row r="${imgRow}" ht="${((PHOTO_HEIGHT_CM + 0.5) * PT_PER_CM).toFixed(0)}" customHeight="1">` +
+      inlineStrCell('A' + imgRow, 'n° ' + (p.index + 1), topXfId) + '</row>';
     rowsXml += `<row r="${imgRow + 1}" ht="30" customHeight="1"/>`;   // respiration entre deux justificatifs
 
     const rid = 'rId' + (k + 1);
     anchorsXml +=
       '<xdr:oneCellAnchor>' +
-        `<xdr:from><xdr:col>0</xdr:col><xdr:colOff>${Math.round(0.2 * EMU_PER_CM)}</xdr:colOff><xdr:row>${imgRow - 1}</xdr:row><xdr:rowOff>${Math.round(0.15 * EMU_PER_CM)}</xdr:rowOff></xdr:from>` +
+        `<xdr:from><xdr:col>1</xdr:col><xdr:colOff>${Math.round(0.15 * EMU_PER_CM)}</xdr:colOff><xdr:row>${imgRow - 1}</xdr:row><xdr:rowOff>${Math.round(0.15 * EMU_PER_CM)}</xdr:rowOff></xdr:from>` +
         `<xdr:ext cx="${Math.round(wCm * EMU_PER_CM)}" cy="${Math.round(hCm * EMU_PER_CM)}"/>` +
         '<xdr:pic>' +
           `<xdr:nvPicPr><xdr:cNvPr id="${k + 1}" name="Justificatif ${p.index + 1}"/>` +
@@ -1038,7 +1080,7 @@ async function buildWorkbook(){
   /* Photos : onglet supplémentaire + numéro d'Item cliquable */
   let stylesXml = await zip.file('xl/styles.xml').async('string');
   const styleRes = addHyperlinkStyle(stylesXml);
-  const backLinks = await addPhotoSheet(zip, capped, sheetDoc, styleRes.linkXfId);
+  const backLinks = await addPhotoSheet(zip, capped, sheetDoc, styleRes.linkXfId, styleRes.topXfId);
 
   if(backLinks && backLinks.length){
     zip.file('xl/styles.xml', styleRes.stylesXml);
@@ -1206,6 +1248,20 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btnGallery').addEventListener('click', () => $('fileGallery').click());
   $('fileCamera').addEventListener('change', e => handleFile(e.target.files[0]));
   $('fileGallery').addEventListener('change', e => handleFile(e.target.files[0]));
+  /* Safari sur iPhone ignore user-scalable=no : on neutralise explicitement le
+     pincement à deux doigts et le double-tap, pour que la page ne bouge plus. */
+  ['gesturestart','gesturechange','gestureend'].forEach(ev =>
+    document.addEventListener(ev, e => e.preventDefault(), {passive:false}));
+  document.addEventListener('touchmove', e => {
+    if(e.touches.length > 1) e.preventDefault();   // pincement seulement, le défilement reste normal
+  }, {passive:false});
+  let dernierTap = 0;
+  document.addEventListener('touchend', e => {
+    const t = Date.now();
+    if(t - dernierTap < 300) e.preventDefault();   // double-tap = zoom sur iOS
+    dernierTap = t;
+  }, {passive:false});
+
   $('btnClearPhoto').addEventListener('click', clearPhoto);
   $('btnRetryRead').addEventListener('click', retryRead);
 
