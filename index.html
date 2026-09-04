@@ -220,19 +220,19 @@
 
   <div class="card">
     <h2>Export</h2>
-    <p class="field-note" style="margin-top:0;">Les lignes sont automatiquement triées par date et numérotées avant l'export — le classement du fichier Excel et celui des photos correspondent exactement.</p>
+    <p class="field-note" style="margin-top:0;">Les lignes sont triées par date et numérotées automatiquement. Les photos sont intégrées dans le fichier Excel, sur un onglet « Justificatifs » : cliquer sur le numéro d'une ligne ouvre directement sa photo. Un seul fichier à envoyer à la compta.</p>
     <div class="btn-row">
       <button class="btn-main" id="btnExportXlsx" type="button">📊 Générer le fichier Excel (.xlsx)</button>
     </div>
     <div class="btn-row">
-      <button class="btn-secondary" id="btnExportZip" type="button">🗂️ Télécharger les photos (.zip)</button>
+      <button class="btn-secondary" id="btnExportZip" type="button">🗂️ Photos seules (.zip)</button>
       <button class="btn-danger" id="btnResetAll" type="button">🗑️ Tout effacer</button>
     </div>
   </div>
 
   <footer>
-    Fonctionne hors-ligne après le premier chargement (les modèles de lecture OCR sont mis en cache par le navigateur).
-    Les données restent uniquement sur cet appareil.
+    La lecture automatique du ticket nécessite une connexion ; tout le reste (saisie, export Excel, photos)
+    fonctionne hors-ligne. Les données restent uniquement sur cet appareil.
   </footer>
 </main>
 
@@ -776,13 +776,170 @@ function b64ToUint8(b64){
   return arr;
 }
 
+/* ---------- Onglet "Justificatifs" : les photos dans le classeur lui-même ----------
+   Un .xlsx sait embarquer des images (dossier xl/media + un "drawing" qui les
+   positionne). On ajoute donc un second onglet contenant une photo par dépense,
+   et on rend le numéro d'Item de l'onglet S³ cliquable : un clic dessus saute
+   directement à la photo correspondante. Tout reste dans un seul fichier, rien
+   ne dépend d'un dossier extérieur. */
+
+const EMU_PER_CM = 360000;
+const PT_PER_CM = 28.3465;
+const PHOTO_HEIGHT_CM = 12;   // hauteur d'affichage de chaque photo dans le classeur
+const PHOTO_MAX_WIDTH_CM = 16;
+
+function imageSizeOf(blob){
+  return new Promise(resolve => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve({w: img.naturalWidth, h: img.naturalHeight}); };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve({w: 1000, h: 1400}); };
+    img.src = url;
+  });
+}
+function xmlEsc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function inlineStrCell(ref, text, style){
+  if(text === '' || text === null || text === undefined) return '';
+  return `<c r="${ref}"${style !== undefined ? ` s="${style}"` : ''} t="inlineStr"><is><t xml:space="preserve">${xmlEsc(text)}</t></is></c>`;
+}
+
+/* Ajoute à styles.xml une police "lien" (bleu souligné) et un format de cellule
+   qui reprend exactement celui du numéro d'Item, police mise à part. Rien n'est
+   modifié dans les styles existants : on ne fait qu'ajouter à la fin. */
+function addHyperlinkStyle(stylesXml){
+  const fontCount = parseInt(/<fonts count="(\d+)"/.exec(stylesXml)[1], 10);
+  const xfCount = parseInt(/<cellXfs count="(\d+)"/.exec(stylesXml)[1], 10);
+  const newFontId = fontCount;
+  const newXfId = xfCount;
+
+  const linkFont = '<font><u/><sz val="11"/><color rgb="FF0563C1"/><name val="Calibri"/><family val="2"/><scheme val="minor"/></font>';
+  stylesXml = stylesXml.replace(/<fonts count="\d+"([^>]*)>/, `<fonts count="${fontCount + 1}"$1>`);
+  stylesXml = stylesXml.replace('</fonts>', linkFont + '</fonts>');
+
+  // on clone le format du numéro d'Item (bordure + centrage) en changeant la police
+  const itemXf = '<xf numFmtId="0" fontId="' + newFontId + '" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>';
+  stylesXml = stylesXml.replace(/<cellXfs count="\d+"([^>]*)>/, `<cellXfs count="${xfCount + 1}"$1>`);
+  stylesXml = stylesXml.replace('</cellXfs>', itemXf + '</cellXfs>');
+
+  return { stylesXml, linkXfId: newXfId };
+}
+
+/* Construit l'onglet Justificatifs + le drawing qui place les images. */
+async function addPhotoSheet(zip, capped, sheetDoc, linkXfId){
+  const photos = [];
+  for(let i = 0; i < capped.length; i++){
+    const e = capped[i];
+    if(!e.hasPhoto) continue;
+    const blob = await idbGet(e.id);
+    if(!blob) continue;
+    const size = await imageSizeOf(blob);
+    photos.push({ index: i, entry: e, blob, size });
+  }
+  if(photos.length === 0) return false;
+
+  const backLinks = [];
+  let rowsXml = '';
+  let anchorsXml = '';
+  let relsXml = '';
+  let linksXml = '';
+  const cols =
+    '<cols><col min="1" max="1" width="8" customWidth="1"/><col min="2" max="2" width="13" customWidth="1"/>' +
+    '<col min="3" max="3" width="26" customWidth="1"/><col min="4" max="4" width="30" customWidth="1"/>' +
+    '<col min="5" max="5" width="26" customWidth="1"/></cols>';
+
+  rowsXml += '<row r="1" ht="20" customHeight="1">' +
+             inlineStrCell('A1', 'Justificatifs — photos des tickets, dans l\'ordre du tableau') + '</row>';
+  rowsXml += '<row r="3">' + ['N°','Date','Fournisseur','Nature / Description','']
+                .map((t, k) => inlineStrCell(String.fromCharCode(65 + k) + '3', t)).join('') + '</row>';
+
+  let row = 4;
+  photos.forEach((p, k) => {
+    const e = p.entry;
+    const sheetRow = 5 + p.index;      // ligne correspondante dans l'onglet S³
+    const infoRow = row;
+    const imgRow = row + 1;
+
+    // ratio conservé, hauteur imposée, largeur plafonnée pour les photos paysage
+    let hCm = PHOTO_HEIGHT_CM;
+    let wCm = hCm * (p.size.w / p.size.h);
+    if(wCm > PHOTO_MAX_WIDTH_CM){ wCm = PHOTO_MAX_WIDTH_CM; hCm = wCm * (p.size.h / p.size.w); }
+
+    rowsXml += `<row r="${infoRow}" ht="22" customHeight="1">` +
+      inlineStrCell('A' + infoRow, String(p.index + 1)) +
+      inlineStrCell('B' + infoRow, e.date) +
+      inlineStrCell('C' + infoRow, e.provider || '') +
+      inlineStrCell('D' + infoRow, e.description || '') +
+      inlineStrCell('E' + infoRow, '↩ Retour à la ligne ' + (p.index + 1) + ' du tableau') +
+      '</row>';
+    linksXml += `<hyperlink ref="E${infoRow}" location="Sheet1!A${sheetRow}" display="Retour au tableau"/>`;
+
+    rowsXml += `<row r="${imgRow}" ht="${(hCm * PT_PER_CM).toFixed(0)}" customHeight="1"/>`;
+    rowsXml += `<row r="${imgRow + 1}" ht="30" customHeight="1"/>`;   // respiration entre deux justificatifs
+
+    const rid = 'rId' + (k + 1);
+    anchorsXml +=
+      '<xdr:oneCellAnchor>' +
+        `<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${imgRow - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
+        `<xdr:ext cx="${Math.round(wCm * EMU_PER_CM)}" cy="${Math.round(hCm * EMU_PER_CM)}"/>` +
+        '<xdr:pic>' +
+          `<xdr:nvPicPr><xdr:cNvPr id="${k + 1}" name="Justificatif ${p.index + 1}"/>` +
+          '<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>' +
+          `<xdr:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
+          '<xdr:spPr><a:xfrm><a:off x="0" y="0"/>' +
+          `<a:ext cx="${Math.round(wCm * EMU_PER_CM)}" cy="${Math.round(hCm * EMU_PER_CM)}"/></a:xfrm>` +
+          '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>' +
+        '</xdr:pic><xdr:clientData/>' +
+      '</xdr:oneCellAnchor>';
+
+    relsXml += `<Relationship Id="${rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/photo${k + 1}.jpg"/>`;
+    zip.file(`xl/media/photo${k + 1}.jpg`, p.blob, { compression: 'STORE' });
+
+    // le numéro d'Item de l'onglet S³ devient un lien vers la photo
+    const itemCell = findOrCreateCell(sheetDoc, 'A' + sheetRow);
+    itemCell.setAttribute('s', String(linkXfId));
+    backLinks.push({ sheetRow, targetRow: infoRow });
+    row = imgRow + 2;
+  });
+
+  zip.file('xl/worksheets/sheet2.xml',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+    cols + '<sheetData>' + rowsXml + '</sheetData>' +
+    '<hyperlinks>' + linksXml + '</hyperlinks>' +
+    '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>' +
+    '<drawing r:id="rIdDrawing"/></worksheet>');
+
+  zip.file('xl/worksheets/_rels/sheet2.xml.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>' +
+    '</Relationships>');
+
+  zip.file('xl/drawings/drawing1.xml',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" ' +
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ' +
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+    anchorsXml + '</xdr:wsDr>');
+
+  zip.file('xl/drawings/_rels/drawing1.xml.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    relsXml + '</Relationships>');
+
+  return backLinks;
+}
+
 async function buildWorkbook(){
   const zip = await JSZip.loadAsync(b64ToUint8(TEMPLATE_B64));
   const parser = new DOMParser();
   const serializer = new XMLSerializer();
 
   const sheetXml = await zip.file('xl/worksheets/sheet1.xml').async('string');
-  const sheetDoc = parser.parseFromString(sheetXml, 'application/xml');
+  let sheetDoc = parser.parseFromString(sheetXml, 'application/xml');
 
   const surname = $('fSurname').value.trim();
   const name = $('fName').value.trim();
@@ -809,6 +966,49 @@ async function buildWorkbook(){
     setText(sheetDoc, 'L' + row, e.place || '');
     setText(sheetDoc, 'M' + row, e.mission || '');
   });
+
+  /* Photos : onglet supplémentaire + numéro d'Item cliquable */
+  let stylesXml = await zip.file('xl/styles.xml').async('string');
+  const styleRes = addHyperlinkStyle(stylesXml);
+  const backLinks = await addPhotoSheet(zip, capped, sheetDoc, styleRes.linkXfId);
+
+  if(backLinks && backLinks.length){
+    zip.file('xl/styles.xml', styleRes.stylesXml);
+
+    // liens internes "numéro d'Item -> photo" ajoutés au bloc <hyperlinks> existant
+    const linksXml = backLinks.map(l =>
+      `<hyperlink ref="A${l.sheetRow}" location="Justificatifs!A${l.targetRow}" display="Voir le justificatif" tooltip="Voir la photo du justificatif"/>`).join('');
+    let sheetStr = serializer.serializeToString(sheetDoc);
+    if(sheetStr.indexOf('</hyperlinks>') !== -1){
+      sheetStr = sheetStr.replace('</hyperlinks>', linksXml + '</hyperlinks>');
+    } else {
+      sheetStr = sheetStr.replace('</sheetData>', '</sheetData><hyperlinks>' + linksXml + '</hyperlinks>');
+    }
+    sheetDoc = parser.parseFromString(sheetStr, 'application/xml');
+
+    // déclaration du nouvel onglet
+    let wbRels = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+    const usedIds = (wbRels.match(/Id="rId(\d+)"/g) || []).map(s => parseInt(/\d+/.exec(s)[0], 10));
+    const newRid = 'rId' + (Math.max(0, ...usedIds) + 1);
+    wbRels = wbRels.replace('</Relationships>',
+      `<Relationship Id="${newRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>`);
+    zip.file('xl/_rels/workbook.xml.rels', wbRels);
+
+    let wbMain = await zip.file('xl/workbook.xml').async('string');
+    wbMain = wbMain.replace('</sheets>',
+      `<sheet name="Justificatifs" sheetId="2" r:id="${newRid}"/></sheets>`);
+    zip.file('xl/workbook.xml', wbMain);
+
+    let ctypes = await zip.file('[Content_Types].xml').async('string');
+    if(ctypes.indexOf('Extension="jpg"') === -1){
+      ctypes = ctypes.replace('<Default Extension="rels"',
+        '<Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="rels"');
+    }
+    ctypes = ctypes.replace('</Types>',
+      '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+      '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>');
+    zip.file('[Content_Types].xml', ctypes);
+  }
 
   /* Le modèle stocke un résultat en cache (<v>) à côté de chaque formule, tous à 0.
      On les retire partout : sinon un tableur qui ne recalcule pas à l'ouverture
@@ -873,7 +1073,7 @@ async function exportXlsx(){
   const surname = fileSafe($('fSurname').value) || 'NDF';
   const dateTag = $('fMissionDate').value || new Date().toISOString().slice(0,10);
   downloadBlob(blob, `NDF_${surname}_${dateTag}.xlsx`);
-  toast(`Fichier généré (${count} ligne${count>1?'s':''})`);
+  toast(`Fichier généré (${count} ligne${count>1?'s':''}, photos incluses)`);
   if(overflow > 0) toast(`Attention : ${overflow} ligne(s) au-delà de 40 non incluses`);
 }
 
