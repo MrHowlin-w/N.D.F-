@@ -90,6 +90,9 @@
   .photo-stamp{font-size:.76rem;color:var(--muted);margin-top:8px;text-align:center;}
   .read-warn{white-space:pre-line;}
   .row2.gap{margin-top:10px;}
+  .dup-warn{background:#fdecea;color:#8c1d13;border:1.5px solid var(--danger);border-radius:9px;padding:9px 11px;font-size:.82rem;margin-top:10px;white-space:pre-line;font-weight:600;}
+  @media (prefers-color-scheme: dark){ .dup-warn{background:#3a1512;color:#ffb4ab;} }
+  .dup-tag{color:var(--danger);font-weight:700;font-size:.72rem;}
   .cell-main .prov{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .cell-amount .eur{display:block;font-size:.7rem;color:var(--muted);font-weight:400;}
   .thumb{width:34px;height:34px;object-fit:cover;border-radius:6px;border:1px solid var(--border);cursor:pointer;}
@@ -160,6 +163,7 @@
     <input type="file" id="fileGallery" accept="image/*">
     <div class="ocr-status" id="ocrStatus"><span class="spinner"></span><span id="ocrStatusText">Lecture du ticket…</span></div>
     <div class="photo-stamp" id="photoStamp" style="display:none;"></div>
+    <div class="dup-warn" id="dupWarn" style="display:none;"></div>
     <div class="warn read-warn" id="readWarn" style="display:none;"></div>
 
     <div class="row2 gap">
@@ -274,6 +278,7 @@
       <span>Total note de frais</span>
       <b id="totalEur">0.00 €</b>
     </div>
+    <div class="dup-warn" id="dupListWarn" style="display:none;"></div>
     <div class="warn" id="limitWarn" style="display:none;">
       Le modèle Excel gère 40 lignes maximum. Exporte cette note de frais puis démarre une seconde note pour la suite.
     </div>
@@ -293,7 +298,7 @@
 
   <footer>
     La lecture automatique du ticket nécessite une connexion ; tout le reste (saisie, export Excel, photos)
-    fonctionne hors-ligne. Les données restent uniquement sur cet appareil. · Version 2.1
+    fonctionne hors-ligne. Les données restent uniquement sur cet appareil. · Version 2.2
   </footer>
 </main>
 
@@ -391,6 +396,9 @@ let currentPhotoAt = null;   // horodatage de la prise de vue, "AAAA-MM-JJ HH:MM
 let currentPhotoAtExact = true;   // false si l'horodatage vient de la date du fichier et non de la photo elle-même
 let readToken = 0;   // change à chaque nouvelle lecture ou changement de formulaire : une réponse tardive est ignorée
 let busyAdding = false;
+let listDupCount = 0;   // nombre de lignes de la liste signalées en double (hors paires déjà confirmées)
+let pendingDupOk = [];  // lignes que l'utilisateur vient de confirmer comme distinctes de la dépense en cours
+let currentPhotoHash = '';   // empreinte du fichier photo d'origine : repère une même photo choisie deux fois
 let editingId = null;
 
 function loadState(){
@@ -532,6 +540,128 @@ function showReadWarn(lines){
   else { el.textContent = ''; el.style.display = 'none'; }
 }
 
+/* ===================== Détection des doublons =====================
+   Un même ticket scanné deux fois par erreur est repéré de trois façons :
+   - c'est exactement la même photo (même fichier choisi deux fois dans la galerie) ;
+   - même numéro de facture et même montant ;
+   - même date et même montant, chez le même commerce (et même heure si elle est connue).
+   Deux achats du même montant le même jour mais à des heures différentes, ou chez
+   deux commerces différents, ne sont PAS considérés comme des doublons. */
+function bytesHash(bytes){
+  let h1 = 0x811c9dc5, h2 = 0x9e3779b9;
+  for(let i = 0; i < bytes.length; i++){
+    const b = bytes[i];
+    h1 = Math.imul(h1 ^ b, 0x01000193);
+    h2 = Math.imul(h2 ^ b, 0x85ebca6b); h2 ^= h2 >>> 13;
+  }
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0') + '-' + bytes.length;
+}
+async function fileHash(file){
+  try{ return bytesHash(new Uint8Array(await file.arrayBuffer())); }catch(_){ return ''; }
+}
+function normKey(str){
+  return String(str || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+function providersAlike(a, b){
+  if(a === b) return true;
+  const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+  if(short.length >= 2 && long.indexOf(short) === 0) return true;    // « BP » / « BP Station »
+  if(short.length >= 4 && long.indexOf(short) !== -1) return true;   // « Total » / « Station Total »
+  let i = 0;
+  while(i < short.length && short[i] === long[i]) i++;
+  return i >= 5;
+}
+function entryTTC(e){ return round2((e.ht || 0) + (e.vat || 0)); }
+
+function minutesOf(t){ const m = /^(\d{2}):(\d{2})$/.exec(t || ''); return m ? (+m[1]) * 60 + (+m[2]) : null; }
+
+/* Compare une dépense « a » à une dépense déjà enregistrée « b ».
+   Renvoie null, ou { level: 'certain' | 'probable', why: '...' }.
+   Les indices les plus sûrs (photo, numéro de facture, date + heure) sont examinés
+   en premier : une lecture un peu différente du commerce, du montant ou de la devise
+   entre deux scans du même ticket ne doit pas suffire à masquer le doublon. */
+function duplicateReason(a, b){
+  if(a.photoHash && b.photoHash && a.photoHash === b.photoHash) return { level: 'certain', why: 'c\'est exactement la même photo' };
+
+  const pa = normKey(a.provider), pb = normKey(b.provider);
+  const bothProviders = !!(pa && pb);
+  const sameProvider = bothProviders && providersAlike(pa, pb);
+  const ia = normKey(a.invoiceNumber), ib = normKey(b.invoiceNumber);
+  const sameInvoice = !!(ia && ib && ia === ib);
+  const ta = entryTTC(a), tb = entryTTC(b);
+  const sameAmount = ta > 0 && tb > 0 && Math.abs(ta - tb) <= 0.005;
+  const sameCurrency = String(a.currency || 'EUR').toUpperCase() === String(b.currency || 'EUR').toUpperCase();
+  const bothDates = !!(a.date && b.date);
+  const sameDate = bothDates && a.date === b.date;
+  const ma = minutesOf(a.time), mb = minutesOf(b.time);
+  const bothTimes = ma !== null && mb !== null;
+  const sameTime = bothTimes && ma === mb;
+
+  // 1. même numéro de facture et même montant
+  if(sameInvoice && sameAmount){
+    if(!bothDates || sameDate) return { level: 'certain', why: 'même numéro de facture et même montant' };
+    // dates différentes : un numéro court (« 12 ») se répète d'un jour à l'autre, on ne signale que les numéros longs
+    if(ia.length >= 4) return { level: 'probable', why: 'même numéro de facture et même montant, mais dates différentes' };
+    return null;
+  }
+  // 2. même date, même heure, même montant
+  if(sameDate && sameTime && sameAmount) return { level: 'certain', why: 'même date, même heure et même montant' };
+  // 3. le montant diffère (ou n'a pas été lu), mais tout le reste désigne le même ticket
+  if(sameInvoice && sameProvider && (!bothDates || sameDate)) return { level: 'probable', why: 'même numéro de facture et même commerce (montant lu différemment ?)' };
+  if(sameDate && sameTime && sameProvider) return { level: 'probable', why: 'même date, même heure et même commerce (montant lu différemment ?)' };
+  // 4. indices plus faibles : même date et même montant
+  if(!sameDate || !sameAmount || !sameCurrency) return null;
+  if(bothProviders && !sameProvider) return null;     // deux commerces différents
+  if(ia && ib) return null;                           // deux numéros de facture différents : deux achats distincts
+  if(bothTimes){
+    return Math.abs(ma - mb) <= 2 ? { level: 'probable', why: 'même date, même montant, heures à 2 minutes près' } : null;
+  }
+  return { level: 'probable', why: 'même date et même montant' + (sameProvider ? ', même commerce' : '') };
+}
+/* L'utilisateur a déjà confirmé que ces deux lignes sont bien deux dépenses distinctes. */
+function pairAccepted(a, b){
+  return !!((a.id && Array.isArray(b.dupOk) && b.dupOk.includes(a.id)) || (b.id && Array.isArray(a.dupOk) && a.dupOk.includes(b.id)));
+}
+/* Lignes déjà enregistrées qui ressemblent à « candidate » (hors la ligne excludeId). */
+function findDuplicates(candidate, excludeId){
+  const out = [];
+  const sorted = sortedEntries();
+  for(let i = 0; i < sorted.length; i++){
+    const e = sorted[i];
+    if(e.id === excludeId) continue;
+    if(pairAccepted(candidate, e)) continue;
+    const r = duplicateReason(candidate, e);
+    if(r) out.push({ entry: e, line: i + 1, level: r.level, why: r.why });
+  }
+  out.sort((x, y) => (x.level === y.level ? 0 : x.level === 'certain' ? -1 : 1));
+  return out;
+}
+function describeEntry(e){
+  return [stampFR(e.date) + (e.time ? ' ' + e.time : ''), e.provider || '(sans nom)',
+          entryTTC(e).toFixed(2) + ' ' + (currencySymbol(e.currency) || e.currency || '')].filter(Boolean).join(' · ');
+}
+function formCandidate(){
+  const cur = $('fCurrency').value === 'AUTRE' ? ($('fCurrencyOther').value.trim() || 'AUTRE') : $('fCurrency').value;
+  const previous = editingId ? entries.find(e => e.id === editingId) : null;
+  return {
+    id: editingId || '', dupOk: previous && previous.dupOk ? previous.dupOk : [],
+    date: $('fDate').value, time: $('fTime').value || '', provider: $('fProvider').value.trim(),
+    invoiceNumber: $('fInvoice').value.trim(), ht: numOr0($('fHT').value), vat: numOr0($('fVAT').value),
+    currency: cur, photoHash: currentPhotoHash
+  };
+}
+/* Met à jour l'encadré rouge du formulaire. Renvoie la liste des doublons trouvés. */
+function checkFormDuplicate(){
+  const dups = findDuplicates(formCandidate(), editingId);
+  const el = $('dupWarn');
+  if(!dups.length){ el.textContent = ''; el.style.display = 'none'; return dups; }
+  const d = dups[0];
+  el.textContent = '⚠️ Doublon ' + d.level + ' : ce ticket ressemble à la ligne #' + d.line + ' déjà enregistrée (' +
+                   describeEntry(d.entry) + ') — ' + d.why + '.\nNe l\'ajoute pas si c\'est le même ticket.';
+  el.style.display = 'block';
+  return dups;
+}
+
 function currencySymbol(cur){
   return {EUR:'€',USD:'$',GBP:'£',BRL:'R$',CHF:'CHF',XPF:'F'}[cur] || '';
 }
@@ -638,6 +768,7 @@ function clearPhoto(){
   currentPhotoFile = null;
   currentPhotoAt = null;
   currentPhotoAtExact = true;
+  currentPhotoHash = '';
   readToken++;
   showPhotoStamp();
   showReadWarn(null);
@@ -688,13 +819,16 @@ async function handleFile(file, isRetry){
       const light = await fileToCompressedBlob(file);   // version légère, conservée
       if(!light){ const e = new Error('Photo illisible'); e.code = 'BAD_IMAGE'; throw e; }
       const ts = await photoTimestamp(file);
+      const hash = await fileHash(file);
       if(token !== readToken) return;
       currentPhotoFile = file;
       currentPhotoBlob = light;
+      currentPhotoHash = hash;
       currentPhotoAt = ts.stamp;
       currentPhotoAtExact = ts.exact;
       showPhotoPreview(light);
       showPhotoStamp();
+      checkFormDuplicate();   // même photo déjà enregistrée : on le dit tout de suite, avant même la lecture
     }
     const sent = await imageForReading(file, isRetry);
     if(!sent){ const e = new Error('Photo illisible'); e.code = 'BAD_IMAGE'; throw e; }
@@ -777,6 +911,8 @@ async function handleFile(file, isRetry){
 
     updateComputedFields();
     showReadWarn(notes);
+    const dups = checkFormDuplicate();
+    if(dups.length){ toast('⚠️ Doublon ' + dups[0].level + ' de la ligne #' + dups[0].line); return; }
     toast(notes.length ? 'Ticket lu — ' + notes.length + ' point' + (notes.length > 1 ? 's' : '') + ' à vérifier'
                        : (isRetry ? 'Nouvelle lecture terminée — vérifie les champs'
                                   : 'Ticket lu automatiquement — vérifie avant d\'ajouter'));
@@ -835,6 +971,7 @@ function resetForm(){
   clearPhoto();
   $('ocrStatus').classList.remove('active');
   editingId = null;
+  checkFormDuplicate();
   $('btnAddEntry').textContent = '➕ Ajouter à la liste';
   $('itemPreviewBadge').textContent = '#' + (entries.length + 1);
 }
@@ -843,6 +980,16 @@ async function addOrUpdateEntry(){
   if(busyAdding) return;
   const date = $('fDate').value;
   if(!date){ toast('Indique la date de la dépense'); $('fDate').focus(); return; }
+  const dups = checkFormDuplicate();
+  if(dups.length){
+    const d = dups[0];
+    const ok = confirm('Doublon ' + d.level + ' : cette dépense ressemble à la ligne #' + d.line + ' déjà enregistrée\n(' +
+                       describeEntry(d.entry) + ')\n' + d.why + '.\n\nL\'enregistrer quand même ?');
+    if(!ok){ toast(editingId ? 'Modification non enregistrée' : 'Dépense non ajoutée'); return; }
+    pendingDupOk = dups.map(x => x.entry.id);
+  } else {
+    pendingDupOk = [];
+  }
   busyAdding = true;
   try{ await addOrUpdateEntryInner(date); }
   catch(err){
@@ -871,8 +1018,13 @@ async function addOrUpdateEntryInner(date){
     address: $('fAddress').value.trim(),
     mission: $('fMission').value.trim(),
     hasPhoto: !!currentPhotoBlob,
-    photoAt: currentPhotoBlob ? (currentPhotoAt || (previous && previous.photoAt) || '') : ''
+    photoAt: currentPhotoBlob ? (currentPhotoAt || (previous && previous.photoAt) || '') : '',
+    photoHash: currentPhotoBlob ? currentPhotoHash : '',
+    /* lignes ressemblantes que l'utilisateur a confirmées comme distinctes : elles ne
+       sont plus signalées, ni redemandées à chaque export */
+    dupOk: Array.from(new Set([...((previous && previous.dupOk) || []), ...pendingDupOk]))
   };
+  pendingDupOk = [];
 
   if(currentPhotoBlob){
     await idbPut(entry.id, currentPhotoBlob);
@@ -924,11 +1076,13 @@ async function editEntry(id){
     const blob = await idbGet(e.id);
     if(blob){
       currentPhotoBlob = blob;
+      currentPhotoHash = e.photoHash || '';
       currentPhotoAt = e.photoAt || null;
       showPhotoPreview(blob);
       showPhotoStamp();
     }
   }
+  checkFormDuplicate();
   window.scrollTo({top: document.querySelector('.card:nth-of-type(2)').offsetTop - 10, behavior:'smooth'});
 }
 
@@ -939,6 +1093,7 @@ async function deleteEntry(id){
   await idbDelete(id);
   renderTable();
   if(editingId === id) resetForm();
+  else checkFormDuplicate();
 }
 
 /* ===================== Tri + rendu tableau ===================== */
@@ -953,6 +1108,23 @@ async function renderTable(){
   $('countPill').textContent = sorted.length + (sorted.length > 1 ? ' lignes' : ' ligne');
   $('limitWarn').style.display = sorted.length > 40 ? 'block' : 'none';
   $('itemPreviewBadge').textContent = '#' + (entries.length + (editingId ? 0 : 1));
+
+  /* Lignes déjà enregistrées qui se ressemblent entre elles.
+     dupOf : paires à vérifier ; okOf : paires déjà confirmées comme distinctes. */
+  const dupOf = {}, okOf = {};
+  for(let i = 0; i < sorted.length; i++){
+    for(let j = i + 1; j < sorted.length; j++){
+      if(!duplicateReason(sorted[j], sorted[i])) continue;
+      const target = pairAccepted(sorted[i], sorted[j]) ? okOf : dupOf;
+      (target[sorted[i].id] = target[sorted[i].id] || []).push(j + 1);
+      (target[sorted[j].id] = target[sorted[j].id] || []).push(i + 1);
+    }
+  }
+  listDupCount = Object.keys(dupOf).length;
+  $('dupListWarn').style.display = listDupCount ? 'block' : 'none';
+  $('dupListWarn').textContent = listDupCount
+    ? '⚠️ ' + listDupCount + ' lignes semblent en double (marquées « doublon ? »). Vérifie-les et supprime celles en trop avant d\'exporter.'
+    : '';
 
   if(sorted.length === 0){
     $('emptyHint').style.display = 'block';
@@ -1000,6 +1172,7 @@ async function renderTable(){
     meta.textContent = `#${i+1} · ` + (e.date ? e.date.split('-').reverse().join('/') : '?') +
                        (e.time ? ' ' + e.time : '');
     meta.title = meta.textContent;
+
     const prov = document.createElement('span');
     prov.className = 'prov';
     prov.textContent = e.provider || '(sans nom)';
@@ -1012,6 +1185,18 @@ async function renderTable(){
       cat.textContent = sub;
       cat.title = sub;
       main.appendChild(cat);
+    }
+    if(dupOf[e.id]){
+      /* sur sa propre ligne : toujours lisible en entier, même sur un écran étroit */
+      const tag = document.createElement('span');
+      tag.className = 'dup-tag';
+      tag.textContent = '⚠️ doublon ? voir #' + dupOf[e.id].join(', #');
+      main.appendChild(tag);
+    } else if(okOf[e.id]){
+      const tag = document.createElement('span');
+      tag.className = 'cat';
+      tag.textContent = 'semblable à #' + okOf[e.id].join(', #') + ' (confirmé distinct)';
+      main.appendChild(tag);
     }
     tdMain.appendChild(main);
 
@@ -1486,6 +1671,8 @@ async function exportXlsx(){
     toast('Renseigne ' + manquants.join(', ') + ' en haut de la page');
     return;
   }
+  if(listDupCount > 0 &&
+     !confirm('Des lignes semblent en double dans la liste (marquées « doublon ? »).\n\nGénérer le fichier Excel quand même ?')) return;
   let built;
   try{ built = await buildWorkbook(); }
   catch(err){
@@ -1542,6 +1729,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   ['fHT','fVAT','fExchangeRate'].forEach(id => $(id).addEventListener('input', updateComputedFields));
   $('fCurrency').addEventListener('change', onCurrencyChange);
+  ['fDate','fTime','fProvider','fInvoice','fHT','fVAT','fCurrency','fCurrencyOther'].forEach(id => {
+    $(id).addEventListener('input', checkFormDuplicate);
+    $(id).addEventListener('change', checkFormDuplicate);
+  });
   ['fSurname','fName','fMissionDate','fProject'].forEach(id => {
     $(id).addEventListener('input', saveHeader);
     $(id).addEventListener('change', saveHeader);
@@ -1565,7 +1756,7 @@ document.addEventListener('DOMContentLoaded', () => {
     dernierTap = t;
   }, {passive:false});
 
-  $('btnClearPhoto').addEventListener('click', clearPhoto);
+  $('btnClearPhoto').addEventListener('click', () => { clearPhoto(); checkFormDuplicate(); });
   $('btnRetryRead').addEventListener('click', retryRead);
 
   $('btnAddEntry').addEventListener('click', addOrUpdateEntry);
