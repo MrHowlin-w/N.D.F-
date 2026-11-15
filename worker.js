@@ -15,9 +15,14 @@
      - essaie plusieurs modèles dans l'ordre : si l'un est retiré par Google
        ou a épuisé son quota, le suivant prend le relais ;
      - contrôle et nettoyage de la réponse (dates, montants, cohérence HT/TVA/TTC).
+
+   Nouveauté de la version 2.3 :
+     - mode « compare » : l'appli envoie deux photos et le modèle dit s'il s'agit
+       du même ticket photographié deux fois (contenu imprimé, police, format,
+       plis et froissures) ou de deux tickets différents.
    ===================================================================== */
 
-const VERSION = 'ndf-worker-2.1';
+const VERSION = 'ndf-worker-2.3';
 
 /* Modèles essayés dans l'ordre. Le premier disponible répond.
    Pour en ajouter ou en retirer un, modifier simplement cette liste. */
@@ -92,6 +97,47 @@ Devise
 Honnêteté
 - N'invente rien. Si une information est absente ou illisible, mets null pour cette clé. Une valeur fausse est bien plus grave qu'une valeur manquante.
 - "confidence" : « haute » si tout est net et cohérent, « moyenne » si un ou deux champs sont incertains, « basse » si le document est difficile à lire ou si l'image ne montre pas un justificatif de dépense.`;
+
+const COMPARE_PROMPT = `Tu es un contrôleur de notes de frais. On te montre deux photos de justificatifs de dépense : la photo A, puis la photo B. Les deux dépenses ont été saisies séparément et se ressemblent (même date, même montant ou même commerce). Tu dois dire si les deux photos montrent LE MÊME document papier photographié deux fois par erreur, ou deux documents réellement différents.
+
+Examine les deux photos avec soin et compare-les sur deux plans.
+
+1. Le contenu imprimé, ligne par ligne
+- numéro de ticket, de facture, de transaction, de caisse, d'autorisation ;
+- date et heure, à la minute et à la seconde si elles sont imprimées ;
+- liste des articles, quantités, prix, total, moyen de paiement ;
+- en-tête, adresse, mentions de bas de ticket.
+Ne compare que ce qui est NETTEMENT lisible sur les DEUX photos. Un élément visible sur une seule photo (l'autre étant coupée, floue ou pliée à cet endroit) ne prouve rien, ni dans un sens ni dans l'autre. Deux photos du même document montrent les mêmes valeurs partout où les deux sont lisibles. Deux tickets distincts du même commerce, du même jour et du même montant diffèrent au moins par leur numéro ou leur heure.
+
+2. L'aspect physique du papier
+- police de caractères, mise en page, largeur et longueur du ticket, logo ;
+- plis, froissures, déchirures, coins cornés, forme de la découpe en haut et en bas ;
+- taches, zones d'impression pâles ou baveuses, annotations manuscrites, tampons, agrafes.
+Les mêmes défauts aux mêmes endroits désignent le même document. Tiens compte du fait que l'angle de prise de vue, l'éclairage, le cadrage, le fond et la netteté peuvent changer d'une photo à l'autre : une différence de couleur, d'ombre ou d'orientation ne prouve rien. Un pli présent sur une photo et absent sur l'autre peut aussi venir d'une manipulation du papier entre les deux prises.
+
+Réponds UNIQUEMENT par un objet JSON (sans texte autour, sans balises Markdown) :
+
+{
+  "verdict": "same_document" | "same_purchase" | "different" | "uncertain",
+  "confidence": "haute" | "moyenne" | "basse",
+  "reason": "une phrase courte en français qui cite l'indice décisif",
+  "printedContent": "identique" | "différent" | "illisible",
+  "physicalAspect": "identique" | "différent" | "indéterminé"
+}
+
+Choix du verdict
+- "same_document" : c'est le même papier photographié deux fois.
+- "same_purchase" : ce sont deux papiers différents mais ils justifient le MÊME achat (par exemple le ticket de caisse et le ticket de carte bancaire de la même transaction, ou une facture et son reçu). C'est aussi un doublon de dépense.
+- "different" : deux achats distincts.
+- "uncertain" : les photos ne permettent pas de trancher (floues, coupées, illisibles). Ne devine pas.
+
+Règles de décision
+- Commence par déterminer la nature de chaque document : ticket de caisse, ticket de carte bancaire, facture, reçu.
+- Deux documents de MÊME nature : le contenu imprimé prime. Si un même élément (numéro de ticket, heure, article, total) est nettement lisible sur les deux photos et a deux valeurs différentes, le verdict est "different", même si les papiers se ressemblent.
+- Deux documents de nature DIFFÉRENTE (par exemple ticket de caisse et ticket de carte bancaire) : leurs numéros ne sont pas comparables et leurs heures peuvent différer d'une ou deux minutes. Juge sur le commerce, la date, le montant total, l'heure à quelques minutes près et, s'ils sont visibles, les derniers chiffres de la carte. S'ils concordent, le verdict est "same_purchase".
+- Pour répondre "different", tu dois avoir vu au moins un élément nettement lisible sur les DEUX photos avec deux valeurs différentes, et citer ces deux valeurs dans "reason". Sinon réponds "uncertain".
+- L'erreur grave est de répondre "different" pour un même ticket : le doublon serait alors remboursé deux fois. Dans le doute, réponds "uncertain".
+- Dans "reason", cite ce que tu as réellement vu (par exemple « même numéro de ticket 004512 et même pli en diagonale » ou « heures différentes : 12:04 et 19:31 »).`;
 
 const RETRY_ADDENDUM = `
 
@@ -303,10 +349,9 @@ function normalizeResult(raw) {
 /* Le corps de la requête est assemblé par simple concaténation : l'image (plusieurs
    Mo de base64) n'est ainsi jamais re-sérialisée, ce qui économise du temps de calcul.
    Le base64 ne contient aucun caractère à échapper en JSON. */
-function buildBodyString(imageBase64, mimeType, isRetry, withJsonMode) {
-  const prompt = PROMPT + (isRetry ? RETRY_ADDENDUM : '');
-  return '{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":' + JSON.stringify(mimeType) +
-         ',"data":"' + imageBase64 + '"}},{"text":' + JSON.stringify(prompt) + '}]}]' +
+function buildBodyString(images, prompt, withJsonMode) {
+  const parts = images.map(im => '{"inlineData":{"mimeType":' + JSON.stringify(im.mimeType) + ',"data":"' + im.data + '"}}');
+  return '{"contents":[{"role":"user","parts":[' + parts.join(',') + ',{"text":' + JSON.stringify(prompt) + '}]}]' +
          (withJsonMode ? ',"generationConfig":{"responseMimeType":"application/json"}' : '') + '}';
 }
 
@@ -361,10 +406,11 @@ function errorRank(res) {
   return 4;
 }
 
-async function readTicket(apiKey, imageBase64, mimeType, isRetry) {
+/* Interroge les modèles dans l'ordre jusqu'à obtenir une réponse JSON exploitable. */
+async function askModels(apiKey, images, prompt) {
   let best = null;
   let sawNetworkError = false;
-  const bodyJson = buildBodyString(imageBase64, mimeType, isRetry, true);
+  const bodyJson = buildBodyString(images, prompt, true);
   let bodyPlain = null;
 
   for (const model of MODELS) {
@@ -373,7 +419,7 @@ async function readTicket(apiKey, imageBase64, mimeType, isRetry) {
     // Requête refusée à cause du mode JSON : on retente une fois sans lui,
     // la consigne demande déjà du JSON.
     if (!res.ok && !res.network && res.status === 400 && /mime|generation.?config|json|unknown name|invalid json payload/i.test(res.detail || '')) {
-      if (bodyPlain === null) bodyPlain = buildBodyString(imageBase64, mimeType, isRetry, false);
+      if (bodyPlain === null) bodyPlain = buildBodyString(images, prompt, false);
       res = await callModel(model, apiKey, bodyPlain);
     }
     // Réponse vide ou non exploitable : un second essai sur le même modèle.
@@ -392,6 +438,38 @@ async function readTicket(apiKey, imageBase64, mimeType, isRetry) {
 
   if (!best) return sawNetworkError ? { ok: false, network: true } : { ok: false, status: 404, detail: 'aucun modèle essayé' };
   return { ok: false, status: best.status, detail: best.detail, model: best.model, keyProblem: isKeyProblem(best) };
+}
+
+function normalizeCompare(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const v = normKey(toText(r.verdict, 40) || '');
+  let verdict = 'uncertain';
+  if (v === 'samedocument') verdict = 'same_document';
+  else if (v === 'samepurchase') verdict = 'same_purchase';
+  else if (v === 'different') verdict = 'different';
+  const conf = normKey(toText(r.confidence, 20) || '');
+  // Confiance absente ou inconnue : on ne la suppose pas bonne.
+  const confidence = conf === 'haute' ? 'haute' : conf === 'moyenne' ? 'moyenne' : 'basse';
+  const printed = normKey(toText(r.printedContent, 20) || '');
+  // Un verdict tranché donné avec une confiance basse n'est pas fiable : on le rend incertain.
+  if (verdict !== 'uncertain' && confidence === 'basse') verdict = 'uncertain';
+  // Verdict contredit par le propre constat du modèle sur le contenu imprimé : incertain.
+  if (verdict === 'different' && printed !== 'different') verdict = 'uncertain';
+  if (verdict === 'same_document' && printed === 'different') verdict = 'uncertain';
+  return {
+    verdict, confidence,
+    reason: toText(r.reason, 240),
+    printedContent: toText(r.printedContent, 20),
+    physicalAspect: toText(r.physicalAspect, 20)
+  };
+}
+
+function validImage(b64) {
+  return typeof b64 === 'string' && b64.length >= 100 && /^[A-Za-z0-9+/=]+$/.test(b64.slice(0, 2000));
+}
+function upstreamFailure(res) {
+  if (res.network) return jsonResponse({ error: 'upstream_network_error' }, 502);
+  return jsonResponse({ error: 'upstream_error', status: res.status, keyProblem: !!res.keyProblem, model: res.model || null, detail: res.detail || '' }, 502);
 }
 
 /* ----------------------------- point d'entrée ----------------------------- */
@@ -419,8 +497,24 @@ async function handleRequest(request, env) {
 
   let payload;
   try { payload = await request.json(); } catch (_) { return jsonResponse({ error: 'bad_request' }, 400); }
-  const imageBase64 = payload && payload.imageBase64;
-  if (typeof imageBase64 !== 'string' || imageBase64.length < 100 || !/^[A-Za-z0-9+/=]+$/.test(imageBase64.slice(0, 2000))) {
+  if (!payload || typeof payload !== 'object') return jsonResponse({ error: 'bad_request' }, 400);
+
+  /* ----- mode « compare » : deux photos, même ticket ou non ? ----- */
+  if (payload.mode === 'compare') {
+    const a = payload.imageA, b = payload.imageB;
+    if (!validImage(a) || !validImage(b)) return jsonResponse({ error: 'bad_request', detail: 'deux images attendues' }, 400);
+    if (a.length + b.length > MAX_IMAGE_BASE64_LENGTH) return jsonResponse({ error: 'image_too_large' }, 413);
+    const res = await askModels(geminiKey, [{ mimeType: 'image/jpeg', data: a }, { mimeType: 'image/jpeg', data: b }], COMPARE_PROMPT);
+    if (!res.ok) return upstreamFailure(res);
+    const out = normalizeCompare(res.parsed);
+    out.model = res.model;
+    out.service = VERSION;
+    return jsonResponse(out);
+  }
+
+  /* ----- mode par défaut : lecture d'un ticket ----- */
+  const imageBase64 = payload.imageBase64;
+  if (!validImage(imageBase64)) {
     return jsonResponse({ error: 'bad_request', detail: 'image manquante' }, 400);
   }
   if (imageBase64.length > MAX_IMAGE_BASE64_LENGTH) {
@@ -428,11 +522,8 @@ async function handleRequest(request, env) {
   }
   const mimeType = /^image\/(jpeg|png|webp|heic|heif)$/.test(payload.mimeType || '') ? payload.mimeType : 'image/jpeg';
 
-  const res = await readTicket(geminiKey, imageBase64, mimeType, !!payload.retry);
-  if (!res.ok) {
-    if (res.network) return jsonResponse({ error: 'upstream_network_error' }, 502);
-    return jsonResponse({ error: 'upstream_error', status: res.status, keyProblem: !!res.keyProblem, model: res.model || null, detail: res.detail || '' }, 502);
-  }
+  const res = await askModels(geminiKey, [{ mimeType, data: imageBase64 }], PROMPT + (payload.retry ? RETRY_ADDENDUM : ''));
+  if (!res.ok) return upstreamFailure(res);
 
   const out = normalizeResult(res.parsed);
   out.model = res.model;

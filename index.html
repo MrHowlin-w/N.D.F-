@@ -164,6 +164,7 @@
     <div class="ocr-status" id="ocrStatus"><span class="spinner"></span><span id="ocrStatusText">Lecture du ticket…</span></div>
     <div class="photo-stamp" id="photoStamp" style="display:none;"></div>
     <div class="dup-warn" id="dupWarn" style="display:none;"></div>
+    <div class="field-note" id="dupInfo" style="display:none;margin-top:8px;white-space:pre-line;"></div>
     <div class="warn read-warn" id="readWarn" style="display:none;"></div>
 
     <div class="row2 gap">
@@ -298,7 +299,7 @@
 
   <footer>
     La lecture automatique du ticket nécessite une connexion ; tout le reste (saisie, export Excel, photos)
-    fonctionne hors-ligne. Les données restent uniquement sur cet appareil. · Version 2.2
+    fonctionne hors-ligne. Les données restent uniquement sur cet appareil. · Version 2.3
   </footer>
 </main>
 
@@ -398,6 +399,8 @@ let readToken = 0;   // change à chaque nouvelle lecture ou changement de formu
 let busyAdding = false;
 let listDupCount = 0;   // nombre de lignes de la liste signalées en double (hors paires déjà confirmées)
 let pendingDupOk = [];  // lignes que l'utilisateur vient de confirmer comme distinctes de la dépense en cours
+let comparing = false;   // une comparaison de photos par l'IA est en cours
+let aiVerdicts = {};     // avis de l'IA sur la photo en cours comparée à des lignes enregistrées : { idLigne: {verdict, reason} }
 let currentPhotoHash = '';   // empreinte du fichier photo d'origine : repère une même photo choisie deux fois
 let editingId = null;
 
@@ -622,19 +625,98 @@ function duplicateReason(a, b){
 function pairAccepted(a, b){
   return !!((a.id && Array.isArray(b.dupOk) && b.dupOk.includes(a.id)) || (b.id && Array.isArray(a.dupOk) && a.dupOk.includes(b.id)));
 }
-/* Lignes déjà enregistrées qui ressemblent à « candidate » (hors la ligne excludeId). */
-function findDuplicates(candidate, excludeId){
+/* Ressemblance trop faible pour alerter à elle seule, mais suffisante pour demander
+   à l'IA de comparer les deux photos : même date, et même montant ou même commerce. */
+function weakMatch(a, b){
+  if(!a.date || a.date !== b.date) return false;
+  const ta = entryTTC(a), tb = entryTTC(b);
+  if(ta > 0 && Math.abs(ta - tb) <= 0.005) return true;
+  const pa = normKey(a.provider), pb = normKey(b.provider);
+  return !!(pa && pb && providersAlike(pa, pb));
+}
+const AI_SAME = { same_document: 'c\'est le même ticket photographié deux fois', same_purchase: 'ce sont deux justificatifs du même achat' };
+
+/* L'avis « tickets différents » de l'IA ne lève l'alerte que s'il est donné avec une
+   confiance haute, et jamais contre un doublon certain d'après les champs (même photo,
+   même numéro de facture, même date + heure + montant) : là, c'est l'utilisateur qui tranche. */
+function aiClears(v, r, samePhoto){
+  if(!v || v.verdict !== 'different' || v.confidence !== 'haute' || samePhoto) return false;
+  return !(r && r.level === 'certain');
+}
+/* Lignes déjà enregistrées qui ressemblent à « candidate » (hors la ligne excludeId).
+   verdicts (facultatif) : avis de l'IA après comparaison des photos. Il prime sur la
+   comparaison des champs : « différent » lève l'alerte, « même ticket » la rend certaine. */
+function findDuplicates(candidate, excludeId, verdicts){
   const out = [];
   const sorted = sortedEntries();
   for(let i = 0; i < sorted.length; i++){
     const e = sorted[i];
     if(e.id === excludeId) continue;
     if(pairAccepted(candidate, e)) continue;
+    const v = verdicts ? verdicts[e.id] : null;
     const r = duplicateReason(candidate, e);
-    if(r) out.push({ entry: e, line: i + 1, level: r.level, why: r.why });
+    const samePhoto = !!(candidate.photoHash && e.photoHash && candidate.photoHash === e.photoHash);
+    if(v && AI_SAME[v.verdict]){
+      out.push({ entry: e, line: i + 1, level: 'certain', ai: true,
+                 why: 'l\'IA a comparé les deux photos : ' + AI_SAME[v.verdict] + (v.reason ? ' (' + v.reason + ')' : '') });
+    } else if(aiClears(v, r, samePhoto)){
+      continue;
+    } else if(r){
+      let note = '';
+      if(v && v.verdict === 'uncertain') note = ' ; l\'IA a comparé les deux photos sans pouvoir trancher';
+      else if(v && v.verdict === 'different') note = ' ; l\'IA y voit pourtant deux tickets différents' + (v.reason ? ' (' + v.reason + ')' : '') + ' : à toi de trancher';
+      out.push({ entry: e, line: i + 1, level: r.level, why: r.why + note });
+    }
   }
   out.sort((x, y) => (x.level === y.level ? 0 : x.level === 'certain' ? -1 : 1));
   return out;
+}
+/* Lignes dont la photo mérite d'être comparée par l'IA à la photo en cours (2 au plus). */
+function aiCandidates(candidate, excludeId){
+  const strong = [], weak = [];
+  for(const e of sortedEntries()){
+    if(e.id === excludeId || !e.hasPhoto || pairAccepted(candidate, e) || aiVerdicts[e.id]) continue;
+    if(candidate.photoHash && e.photoHash && candidate.photoHash === e.photoHash) continue;   // même fichier : inutile de demander
+    if(duplicateReason(candidate, e)) strong.push(e);
+    else if(weakMatch(candidate, e)) weak.push(e);
+  }
+  return strong.concat(weak).slice(0, 2);
+}
+/* Fait comparer par l'IA la photo en cours aux photos des lignes ressemblantes :
+   police, format, plis, froissures et contenu imprimé. */
+async function runPhotoComparison(token){
+  if(!currentPhotoBlob) return;
+  const cands = aiCandidates(formCandidate(), editingId);
+  if(!cands.length) return;
+  $('ocrStatus').classList.add('active');
+  $('ocrStatusText').textContent = 'Comparaison avec un ticket déjà enregistré…';
+  comparing = true;   // « Ajouter » attend la fin de la comparaison
+  try{
+    let mine;
+    try{ mine = await fileToCompressedBlob(currentPhotoFile || currentPhotoBlob, 1800, 0.8); }catch(_){ mine = null; }
+    if(token !== readToken) return;
+    if(!mine) mine = currentPhotoBlob;
+    if(!mine) return;
+    for(const e of cands){
+      let other = null;
+      try{ other = await idbGet(e.id); }catch(_){}
+      if(token !== readToken) return;
+      if(!other || !entries.some(x => x.id === e.id)) continue;   // ligne supprimée entre-temps
+      if(mine.size + other.size > 3000000 && currentPhotoBlob) mine = currentPhotoBlob;   // reste sous la limite du service
+      try{
+        const res = await callCompareService(mine, other);
+        if(token !== readToken) return;
+        aiVerdicts[e.id] = { verdict: res.verdict || 'uncertain', confidence: res.confidence || 'basse', reason: res.reason || '' };
+      }catch(err){
+        console.error('Comparaison des photos impossible :', err);
+        if(token !== readToken) return;
+        aiVerdicts[e.id] = { verdict: 'unavailable', confidence: 'basse', reason: '' };
+        break;   // service indisponible : inutile d'insister, la comparaison des champs reste affichée
+      }
+    }
+  } finally {
+    if(token === readToken) comparing = false;
+  }
 }
 function describeEntry(e){
   return [stampFR(e.date) + (e.time ? ' ' + e.time : ''), e.provider || '(sans nom)',
@@ -652,13 +734,30 @@ function formCandidate(){
 }
 /* Met à jour l'encadré rouge du formulaire. Renvoie la liste des doublons trouvés. */
 function checkFormDuplicate(){
-  const dups = findDuplicates(formCandidate(), editingId);
+  const dups = findDuplicates(formCandidate(), editingId, aiVerdicts);
   const el = $('dupWarn');
-  if(!dups.length){ el.textContent = ''; el.style.display = 'none'; return dups; }
-  const d = dups[0];
-  el.textContent = '⚠️ Doublon ' + d.level + ' : ce ticket ressemble à la ligne #' + d.line + ' déjà enregistrée (' +
-                   describeEntry(d.entry) + ') — ' + d.why + '.\nNe l\'ajoute pas si c\'est le même ticket.';
-  el.style.display = 'block';
+  if(!dups.length){ el.textContent = ''; el.style.display = 'none'; }
+  else {
+    const d = dups[0];
+    el.textContent = '⚠️ Doublon ' + d.level + ' : ce ticket ressemble à la ligne #' + d.line + ' déjà enregistrée (' +
+                     describeEntry(d.entry) + ') — ' + d.why + '.\nNe l\'ajoute pas si c\'est le même ticket.';
+    el.style.display = 'block';
+  }
+  /* Ce que l'IA a écarté ou n'a pas pu vérifier, dit en clair */
+  const info = [];
+  const sorted = sortedEntries();
+  for(let i = 0; i < sorted.length; i++){
+    const v = aiVerdicts[sorted[i].id];
+    if(!v || sorted[i].id === editingId) continue;
+    if(v.verdict === 'different' && !dups.some(d => d.entry.id === sorted[i].id)){
+      info.push('✓ Photo comparée par l\'IA à la ligne #' + (i + 1) + ' (' + describeEntry(sorted[i]) + ') : tickets différents' + (v.reason ? ' — ' + v.reason : '') + '.');
+    } else if(v.verdict === 'unavailable'){
+      info.push('Comparaison des photos par l\'IA indisponible : seule la comparaison des champs a été faite.');
+    }
+  }
+  const infoEl = $('dupInfo');
+  infoEl.textContent = info.join('\n');
+  infoEl.style.display = info.length ? 'block' : 'none';
   return dups;
 }
 
@@ -700,10 +799,16 @@ function blobToBase64(blob){
 }
 
 async function callVisionService(blob, isRetry){
+  return postToService({ imageBase64: await blobToBase64(blob), mimeType: 'image/jpeg', retry: !!isRetry });
+}
+/* Demande à l'IA si deux photos montrent le même ticket. */
+async function callCompareService(blobA, blobB){
+  return postToService({ mode: 'compare', imageA: await blobToBase64(blobA), imageB: await blobToBase64(blobB) });
+}
+async function postToService(payload){
   if(!WORKER_URL || WORKER_URL.indexOf('REMPLACE_PAR') === 0 || !APP_SHARED_KEY || APP_SHARED_KEY.indexOf('REMPLACE_PAR') === 0){
     const e = new Error('Service non configuré'); e.code = 'CONFIG_MISSING'; throw e;
   }
-  const base64 = await blobToBase64(blob);
   let resp;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 120000);   // au-delà de 2 minutes, on abandonne
@@ -711,7 +816,7 @@ async function callVisionService(blob, isRetry){
     resp = await fetch(WORKER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-App-Key': APP_SHARED_KEY },
-      body: JSON.stringify({ imageBase64: base64, mimeType: 'image/jpeg', retry: !!isRetry }),
+      body: JSON.stringify(payload),
       signal: ctrl.signal
     });
   }catch(netErr){
@@ -769,7 +874,10 @@ function clearPhoto(){
   currentPhotoAt = null;
   currentPhotoAtExact = true;
   currentPhotoHash = '';
+  aiVerdicts = {};
+  comparing = false;
   readToken++;
+  $('ocrStatus').classList.remove('active');
   showPhotoStamp();
   showReadWarn(null);
   $('fileCamera').value = ''; $('fileGallery').value = '';
@@ -811,6 +919,11 @@ const WARNING_TEXT = {
 async function handleFile(file, isRetry){
   if(!file) return;
   const token = ++readToken;
+  comparing = false;
+  if(isRetry){
+    // une relecture redemande à l'IA les comparaisons restées sans réponse nette
+    Object.keys(aiVerdicts).forEach(id => { if(['unavailable','uncertain'].includes(aiVerdicts[id].verdict)) delete aiVerdicts[id]; });
+  }
   $('ocrStatus').classList.add('active');
   $('ocrStatusText').textContent = isRetry ? 'Nouvelle lecture, plus fine…' : 'Préparation de la photo…';
   showReadWarn(null);
@@ -824,6 +937,7 @@ async function handleFile(file, isRetry){
       currentPhotoFile = file;
       currentPhotoBlob = light;
       currentPhotoHash = hash;
+      aiVerdicts = {};
       currentPhotoAt = ts.stamp;
       currentPhotoAtExact = ts.exact;
       showPhotoPreview(light);
@@ -911,6 +1025,10 @@ async function handleFile(file, isRetry){
 
     updateComputedFields();
     showReadWarn(notes);
+    /* Un ticket ressemblant est déjà enregistré ? L'IA compare les deux photos
+       (contenu imprimé, police, format, plis) pour dire si c'est le même papier. */
+    await runPhotoComparison(token);
+    if(token !== readToken) return;
     const dups = checkFormDuplicate();
     if(dups.length){ toast('⚠️ Doublon ' + dups[0].level + ' de la ligne #' + dups[0].line); return; }
     toast(notes.length ? 'Ticket lu — ' + notes.length + ' point' + (notes.length > 1 ? 's' : '') + ' à vérifier'
@@ -978,6 +1096,7 @@ function resetForm(){
 
 async function addOrUpdateEntry(){
   if(busyAdding) return;
+  if(comparing){ toast('Comparaison des photos en cours — un instant…'); return; }
   const date = $('fDate').value;
   if(!date){ toast('Indique la date de la dépense'); $('fDate').focus(); return; }
   const dups = checkFormDuplicate();
@@ -990,6 +1109,15 @@ async function addOrUpdateEntry(){
   } else {
     pendingDupOk = [];
   }
+  /* Paires que l'IA a écartées avec certitude : mémorisées comme distinctes, pour ne
+     pas être signalées de nouveau dans la liste ni à l'export. */
+  const cand = formCandidate();
+  entries.forEach(e => {
+    const v = aiVerdicts[e.id];
+    if(!v || e.id === editingId) return;
+    const samePhoto = !!(cand.photoHash && e.photoHash && cand.photoHash === e.photoHash);
+    if(aiClears(v, duplicateReason(cand, e), samePhoto)) pendingDupOk.push(e.id);
+  });
   busyAdding = true;
   try{ await addOrUpdateEntryInner(date); }
   catch(err){
