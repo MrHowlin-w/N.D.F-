@@ -332,7 +332,7 @@
 
   <footer>
     La lecture automatique du ticket nécessite une connexion ; tout le reste (saisie, export Excel, photos)
-    fonctionne hors-ligne. Les données restent uniquement sur cet appareil. · Version 2.4
+    fonctionne hors-ligne. Les données restent uniquement sur cet appareil. · Version 2.5
   </footer>
 </main>
 
@@ -2121,6 +2121,8 @@ function addHyperlinkStyle(stylesXml){
      4. la photo, avec « n° X » en face
    Le titre est donc toujours AU-DESSUS de sa propre photo : impossible de lire la
    photo d'une ligne sous l'en-tête d'une autre (défaut de la v2.3). */
+const PHOTO_COL_WIDTHS = [9, 18, 22, 22, 22, 22, 22, 22, 22, 22];   // A..J, en caractères (A..E déclarées dans <cols>)
+const PHOTO_COL_EMU = PHOTO_COL_WIDTHS.map(w => Math.trunc(((256 * w + Math.trunc(128 / 7)) / 256) * 7) * 9525);
 async function addPhotoSheet(zip, capped, sheetDoc, st){
   const photos = [];
   for(let i = 0; i < capped.length; i++){
@@ -2138,7 +2140,7 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
   const cols =
     '<cols><col min="1" max="1" width="9" customWidth="1"/><col min="2" max="2" width="18" customWidth="1"/>' +
     '<col min="3" max="3" width="22" customWidth="1"/><col min="4" max="4" width="22" customWidth="1"/>' +
-    '<col min="5" max="5" width="22" customWidth="1"/></cols>';
+    '<col min="5" max="10" width="22" customWidth="1"/></cols>';
 
   rowsXml += '<row r="1" ht="22" customHeight="1">' +
              inlineStrCell('A1', 'Justificatifs — une photo par page, numérotée comme les lignes du tableau', st.headXfId) + '</row>';
@@ -2177,10 +2179,17 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
 
     const rid = 'rId' + (k + 1);
     const cx = Math.round(wCm * EMU_PER_CM), cy = Math.round(hCm * EMU_PER_CM);
+    /* Ancrage « deux cellules » (twoCellAnchor editAs="oneCell") : c'est le format
+       qu'Excel écrit lui-même quand on insère une image ; il est affiché par Excel
+       sur PC, Mac, iPhone/Android et par les aperçus. On calcule la cellule et le
+       décalage où se termine la photo à partir des largeurs de colonnes. */
+    const off = Math.round(0.15 * EMU_PER_CM);
+    let endCol = 1, endColOff = off + cx;
+    while(endCol < PHOTO_COL_EMU.length - 1 && endColOff > PHOTO_COL_EMU[endCol]){ endColOff -= PHOTO_COL_EMU[endCol]; endCol++; }
     anchorsXml +=
-      '<xdr:oneCellAnchor>' +
-        `<xdr:from><xdr:col>1</xdr:col><xdr:colOff>${Math.round(0.15 * EMU_PER_CM)}</xdr:colOff><xdr:row>${imgRow - 1}</xdr:row><xdr:rowOff>${Math.round(0.15 * EMU_PER_CM)}</xdr:rowOff></xdr:from>` +
-        `<xdr:ext cx="${cx}" cy="${cy}"/>` +
+      '<xdr:twoCellAnchor editAs="oneCell">' +
+        `<xdr:from><xdr:col>1</xdr:col><xdr:colOff>${off}</xdr:colOff><xdr:row>${imgRow - 1}</xdr:row><xdr:rowOff>${off}</xdr:rowOff></xdr:from>` +
+        `<xdr:to><xdr:col>${endCol}</xdr:col><xdr:colOff>${endColOff}</xdr:colOff><xdr:row>${imgRow - 1}</xdr:row><xdr:rowOff>${off + cy}</xdr:rowOff></xdr:to>` +
         '<xdr:pic>' +
           `<xdr:nvPicPr><xdr:cNvPr id="${k + 2}" name="Justificatif ${n}" descr="Justificatif n° ${n} — ${xmlEsc(e.provider || '')}"/>` +
           '<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>' +
@@ -2189,10 +2198,10 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
           `<a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
           '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>' +
         '</xdr:pic><xdr:clientData/>' +
-      '</xdr:oneCellAnchor>';
+      '</xdr:twoCellAnchor>';
 
     relsXml += `<Relationship Id="${rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/photo${n}.jpg"/>`;
-    zip.file(`xl/media/photo${n}.jpg`, p.blob, { compression: 'STORE' });
+    zip.file(`xl/media/photo${n}.jpg`, p.blob, { compression: 'STORE', createFolders: false });
 
     // le numéro d'Item de l'onglet S³ devient un lien vers le bandeau de SA photo
     const itemCell = findOrCreateCell(sheetDoc, 'A' + sheetRow);
@@ -2362,6 +2371,10 @@ async function buildWorkbook(){
     rels = rels.replace(/<Relationship[^>]*calcChain\.xml[^>]*\/>/, '');
     zip.file('xl/_rels/workbook.xml.rels', rels);
   }
+
+  /* JSZip ajoute des entrées « dossier » vides (xl/, xl/media/…) qu'Excel ne produit
+     jamais : on les retire du paquet pour un fichier strictement conforme. */
+  Object.keys(zip.files).forEach(k => { if(zip.files[k].dir) delete zip.files[k]; });
 
   const blob = await zip.generateAsync({
     type: 'blob',
