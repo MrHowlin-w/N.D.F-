@@ -2193,7 +2193,7 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
         '<xdr:pic>' +
           `<xdr:nvPicPr><xdr:cNvPr id="${k + 2}" name="Justificatif ${n}" descr="Justificatif n° ${n} — ${xmlEsc(e.provider || '')}"/>` +
           '<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>' +
-          `<xdr:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
+          `<xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
           '<xdr:spPr><a:xfrm><a:off x="0" y="0"/>' +
           `<a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
           '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>' +
@@ -2216,18 +2216,21 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
     '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
     'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
     '<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>' +
+    `<dimension ref="A1:E${row - 1}"/>` +
+    '<sheetViews><sheetView workbookViewId="0"/></sheetViews>' +
+    '<sheetFormatPr defaultRowHeight="15"/>' +
     cols + '<sheetData>' + rowsXml + '</sheetData>' +
     '<mergeCells count="' + photos.length + '">' + mergesXml + '</mergeCells>' +
     '<hyperlinks>' + linksXml + '</hyperlinks>' +
     '<pageMargins left="0.5" right="0.5" top="0.6" bottom="0.6" header="0.3" footer="0.3"/>' +
     '<pageSetup paperSize="9" orientation="portrait" fitToWidth="1" fitToHeight="0"/>' +
     (nBreaks ? `<rowBreaks count="${nBreaks}" manualBreakCount="${nBreaks}">${breaksXml}</rowBreaks>` : '') +
-    '<drawing r:id="rIdDrawing"/></worksheet>');
+    '<drawing r:id="rId1"/></worksheet>');
 
   zip.file('xl/worksheets/_rels/sheet2.xml.rels',
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
-    '<Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>' +
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>' +
     '</Relationships>');
 
   zip.file('xl/drawings/drawing1.xml',
@@ -2333,6 +2336,21 @@ async function buildWorkbook(){
       '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
       '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>');
     zip.file('[Content_Types].xml', ctypes);
+
+    /* propriétés du document : la liste des onglets doit inclure « Justificatifs » */
+    const appFile = zip.file('docProps/app.xml');
+    if(appFile){
+      let app = await appFile.async('string');
+      // 1er compteur de HeadingPairs = nombre de feuilles (libellé « Worksheets » ou traduit)
+      app = app.replace(/(<HeadingPairs>[\s\S]*?<vt:i4>)(\d+)(<\/vt:i4>)/, (m, a, n, b) => a + (parseInt(n, 10) + 1) + b);
+      app = app.replace(/<TitlesOfParts><vt:vector size="(\d+)" baseType="lpstr">([\s\S]*?)<\/vt:vector><\/TitlesOfParts>/, (m, n, inner) => {
+        const sheetsEnd = inner.indexOf('<vt:lpstr>Sheet1</vt:lpstr>');
+        if(sheetsEnd === -1) return m;
+        const pos = sheetsEnd + '<vt:lpstr>Sheet1</vt:lpstr>'.length;
+        return `<TitlesOfParts><vt:vector size="${parseInt(n, 10) + 1}" baseType="lpstr">` + inner.slice(0, pos) + '<vt:lpstr>Justificatifs</vt:lpstr>' + inner.slice(pos) + '</vt:vector></TitlesOfParts>';
+      });
+      zip.file('docProps/app.xml', app);
+    }
   }
 
   /* Le modèle stocke un résultat en cache (<v>) à côté de chaque formule, tous à 0.
