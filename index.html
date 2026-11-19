@@ -2147,6 +2147,9 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
   rowsXml += '<row r="2" ht="16" customHeight="1">' +
              inlineStrCell('A2', 'Cliquer sur un bandeau bleu pour revenir à la ligne correspondante du tableau.', st.smallXfId) + '</row>';
 
+  const EMU_PER_PT = 12700;
+  const IMG_ROW_PT = Math.round((PHOTO_HEIGHT_CM + 0.5) * PT_PER_CM);
+  let yTop = (22 + 16 + 15) * EMU_PER_PT;   // hauteur des lignes 1, 2 et 3 (ligne 3 vide : 15 pt par défaut)
   let row = 4;
   photos.forEach((p, k) => {
     const e = p.entry;
@@ -2172,7 +2175,7 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
       inlineStrCell('B' + d2, 'Adresse : ' + (e.address || '—'), st.smallXfId) +
       (natureText(e) ? inlineStrCell('D' + d2, 'Nature : ' + natureText(e), st.smallXfId) : '') + '</row>';
 
-    rowsXml += `<row r="${imgRow}" ht="${((PHOTO_HEIGHT_CM + 0.5) * PT_PER_CM).toFixed(0)}" customHeight="1">` +
+    rowsXml += `<row r="${imgRow}" ht="${IMG_ROW_PT}" customHeight="1">` +
       inlineStrCell('A' + imgRow, 'n° ' + n, st.topXfId) + '</row>';
     rowsXml += `<row r="${spRow}" ht="12" customHeight="1"/>`;
     if(k < photos.length - 1) breaksXml += `<brk id="${spRow}" max="16383" man="1"/>`;
@@ -2184,6 +2187,11 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
        sur PC, Mac, iPhone/Android et par les aperçus. On calcule la cellule et le
        décalage où se termine la photo à partir des largeurs de colonnes. */
     const off = Math.round(0.15 * EMU_PER_CM);
+    /* Position absolue de la photo dans la feuille (a:xfrm/a:off). Excel se sert de
+       l'ancrage, mais l'aperçu de l'iPhone (Fichiers, Mail, Messages…) ne lit QUE
+       cette position : laissée à 0, toutes les photos s'empilaient en haut à gauche. */
+    const absX = PHOTO_COL_EMU[0] + off;
+    const absY = yTop + (24 + 17 + 17) * EMU_PER_PT + off;
     let endCol = 1, endColOff = off + cx;
     while(endCol < PHOTO_COL_EMU.length - 1 && endColOff > PHOTO_COL_EMU[endCol]){ endColOff -= PHOTO_COL_EMU[endCol]; endCol++; }
     anchorsXml +=
@@ -2194,7 +2202,7 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
           `<xdr:nvPicPr><xdr:cNvPr id="${k + 2}" name="Justificatif ${n}" descr="Justificatif n° ${n} — ${xmlEsc(e.provider || '')}"/>` +
           '<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>' +
           `<xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
-          '<xdr:spPr><a:xfrm><a:off x="0" y="0"/>' +
+          `<xdr:spPr><a:xfrm><a:off x="${absX}" y="${absY}"/>` +
           `<a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
           '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>' +
         '</xdr:pic><xdr:clientData/>' +
@@ -2207,6 +2215,7 @@ async function addPhotoSheet(zip, capped, sheetDoc, st){
     const itemCell = findOrCreateCell(sheetDoc, 'A' + sheetRow);
     itemCell.setAttribute('s', String(st.linkXfId));
     backLinks.push({ sheetRow, targetRow: titleRow });
+    yTop += (24 + 17 + 17 + IMG_ROW_PT + 12) * EMU_PER_PT;   // titre + 2 lignes de détail + photo + espace
     row = spRow + 1;
   });
 
@@ -2357,12 +2366,39 @@ async function buildWorkbook(){
      On les retire partout : sinon un tableur qui ne recalcule pas à l'ouverture
      (LibreOffice par défaut, certains aperçus mobiles) afficherait un total à 0
      alors que les lignes sont bonnes. */
+  /* … puis on y écrit le BON résultat calculé ici (TTC, montant en euros, total).
+     Ainsi le total et les montants s'affichent même dans une visionneuse qui ne
+     recalcule pas (aperçu du téléphone, Excel en lecture seule, messagerie…).
+     Excel recalcule de toute façon à l'ouverture (fullCalcOnLoad). */
+  const cached = {};
+  let grandTotal = 0;
+  for(let row = 5; row <= 44; row++){
+    const e = capped[row - 5];
+    const h = e ? round2((e.ht || 0) + (e.vat || 0)) : 0;
+    const k = e ? round2(h * (e.exchangeRate || 1)) : 0;
+    cached['H' + row] = h;
+    cached['K' + row] = k;
+    grandTotal += k;
+  }
+  grandTotal = round2(grandTotal);
   const allCells = sheetDoc.getElementsByTagName('c');
   for(let i = 0; i < allCells.length; i++){
     const c = allCells[i];
-    if(c.getElementsByTagName('f').length === 0) continue;
+    const fs = c.getElementsByTagName('f');
+    if(fs.length === 0) continue;
     const vs = c.getElementsByTagName('v');
     while(vs.length) c.removeChild(vs[0]);
+    const ref = c.getAttribute('r');
+    const ftxt = (fs[0].textContent || '').replace(/\s/g, '').toUpperCase();
+    let val = null;
+    if(Object.prototype.hasOwnProperty.call(cached, ref)) val = cached[ref];
+    else if(ftxt === 'SUM(K5:K44)') val = grandTotal;
+    if(val !== null){
+      c.removeAttribute('t');
+      const v = sheetDoc.createElementNS(XL_NS, 'v');
+      v.appendChild(sheetDoc.createTextNode(String(val)));
+      c.appendChild(v);
+    }
   }
 
   zip.file('xl/worksheets/sheet1.xml', serializer.serializeToString(sheetDoc));
